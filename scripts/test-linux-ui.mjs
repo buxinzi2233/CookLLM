@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { appUpdateFixtures } from "./test-linux-app-update.mjs";
 import { cudaUiFixtures } from "./test-linux-cuda-ui.mjs";
-import { mkdtemp, mkdir, readFile, writeFile, symlink, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, symlink, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -25,8 +25,35 @@ let passed = 0;
 async function test(name, run) { calls.length = 0; platform("Linux x86_64"); await run(); console.log(`ok ${++passed} - ${name}`); }
 const asts = new Map();
 let engineHelpers = {};
+const normalize = (file) => file.split("\\").join("/");
+/** 只把 src 内的 .ts/.tsx（含 index）计入闭包；css 与 node_modules 依赖保持原样。 */
+async function resolveModule(from, specifier) {
+  const base = normalize(join(dirname(from), specifier));
+  const candidates = /\.[cm]?[jt]sx?$/.test(specifier) ? [base] : [`${base}.ts`, `${base}.tsx`, `${base}/index.ts`, `${base}/index.tsx`];
+  for (const candidate of candidates) {
+    try { if ((await stat(join(root, "src", candidate))).isFile()) return candidate; } catch { /* 非 src 模块 */ }
+  }
+  return null;
+}
+/** 按 import 关系递归收集入口模块的真实依赖闭包，重构上游文件后清单不会过期。 */
+async function moduleClosure(entries) {
+  const closure = new Set();
+  const queue = entries.map(normalize);
+  while (queue.length) {
+    const file = queue.shift();
+    if (closure.has(file)) continue;
+    closure.add(file);
+    const source = await readFile(join(root, "src", file), "utf8");
+    for (const match of source.matchAll(/(?:from|import)\s*\(?\s*["'](\.[^"']+)["']/g)) {
+      const target = await resolveModule(file, match[1]);
+      if (target && !closure.has(target)) queue.push(target);
+    }
+  }
+  return [...closure].sort();
+}
 async function expression(file, name, deps) {
-  if (file === "components/SettingsPage.tsx") deps = {
+  // 引擎卡片是 Settings 页里引擎选择/更新状态的唯一实现（v0.4.1 起从 SettingsPage 迁出）。
+  if (file === "components/settings/EngineCard.tsx") deps = {
     ...engineHelpers,
     engineSelection: { current: { backend: deps.backend ?? "vulkan", cudaVersion: deps.cudaVersion ?? "auto", generation: 0 } },
     engineOperation: { current: { id: 0, active: name === "handleEngineProgress", mounted: true } }, setCheckResult() {}, ...deps,
@@ -47,19 +74,24 @@ async function expression(file, name, deps) {
 try {
   await symlink(join(root, "node_modules"), join(temp, "node_modules"), process.platform === "win32" ? "junction" : "dir");
   await mkdir(join(temp, "components"));
-  for (const file of ["platform.ts", "data.ts", "utils.ts", "tauri.ts", "i18n.ts", "components/AppUpdateDialog.tsx", "components/EngineModal.tsx", "components/Playground.tsx", "components/SettingsPage.tsx", "components/ConfirmModal.tsx"]) {
+  const closure = await moduleClosure(["platform.ts", "data.ts", "utils.ts", "tauri.ts", "i18n.ts", "components/AppUpdateDialog.tsx", "components/EngineModal.tsx", "components/Playground.tsx", "components/SettingsPage.tsx", "components/ConfirmModal.tsx"]);
+  for (const file of closure) {
     let source = await readFile(join(root, "src", file), "utf8");
     // Desktop app has no SSR entry. Supply only the server snapshot in this
     // temporary test module; translations, component state and handlers stay real.
     if (file === "i18n.ts") source = source.replace("useSyncExternalStore(subscribe, getLocale)", "useSyncExternalStore(subscribe, getLocale, getLocale)");
     const { outputText } = ts.transpileModule(source, { compilerOptions });
-    await writeFile(join(temp, file.replace(/\.tsx?$/, ".mjs")), outputText.replace(/(from\s+["'])(\.{1,2}\/[^"']+)(["'])/g, "$1$2.mjs$3"));
+    const target = join(temp, file.replace(/\.tsx?$/, ".mjs"));
+    await mkdir(dirname(target), { recursive: true });
+    await writeFile(target, outputText.replace(/(from\s+["'])(\.{1,2}\/[^"']+)(["'])/g, "$1$2.mjs$3"));
   }
   const p = await import(pathToFileURL(join(temp, "platform.mjs")));
   const bridge = await import(pathToFileURL(join(temp, "tauri.mjs")));
   engineHelpers = { engineDownloadInfo: bridge.engineDownloadInfo, engineReleaseUpToDate: bridge.engineReleaseUpToDate };
   const i18n = await import(pathToFileURL(join(temp, "i18n.mjs")));
+  const utils = await import(pathToFileURL(join(temp, "utils.mjs")));
   const { default: UpdateDialog } = await import(pathToFileURL(join(temp, "components/AppUpdateDialog.mjs")));
+  const { default: ChangelogViewer } = await import(pathToFileURL(join(temp, "components/ChangelogViewer.mjs")));
   const { default: EngineModal } = await import(pathToFileURL(join(temp, "components/EngineModal.mjs")));
   const { default: Playground } = await import(pathToFileURL(join(temp, "components/Playground.mjs")));
   const { default: Settings } = await import(pathToFileURL(join(temp, "components/SettingsPage.mjs")));
@@ -152,8 +184,12 @@ try {
     platform("Win32"); save(); assert.equal(saved.path, "/引擎/A\\B"); assert.equal(saved.backend, "cuda");
   });
   await test("actual candidate selection and settings active state preserve Linux case", async () => {
+    // v0.4.1：activeEngine 计算已从 SettingsPage 迁到 hooks/useEngines.ts 的 activeAppEngine。
     const engines = [{ id: "upper", path: "/Engine" }, { id: "lower", path: "/engine" }];
-    assert.equal((await expression("components/SettingsPage.tsx", "activeEngine", { ...p, engines, config: {}, serverPath: "/engine" })).id, "lower");
+    const useEngines = await expression("hooks/useEngines.ts", "useEngines", { ...p, useMemo: (compute) => compute() });
+    const derived = useEngines({ config: { engines, serverPath: "/engine" }, persist: assert.fail, setToast: assert.fail, t: assert.fail });
+    assert.equal(derived.activeAppEngine.id, "lower");
+    assert.equal(derived.appEngines, engines);
     assert.equal(await expression("components/EngineModal.tsx", "isSelected", { ...p, path: "/engine", c: engines[0] }), false);
     platform("Win32");
     assert.equal(await expression("components/EngineModal.tsx", "isSelected", { ...p, path: "/engine", c: engines[0] }), true);
@@ -162,7 +198,7 @@ try {
     platform("Linux aarch64");
     const errors = [];
     for (const name of ["startUpdate", "forceReinstall", "runUpdate", "ensureRemote"]) {
-      const handler = await expression("components/SettingsPage.tsx", name, { ...p, t, backend: "cuda", remote: null, setRemote() {}, setEngineError: (error) => errors.push(error) });
+      const handler = await expression("components/settings/EngineCard.tsx", name, { ...p, t, backend: "cuda", remote: null, setRemote() {}, setEngineError: (error) => errors.push(error) });
       await handler("cuda");
     }
     for (const name of ["startDownload", "startInstall"]) {
@@ -225,16 +261,17 @@ try {
   await test("actual hardware refresh preserves explicit user selection across platforms", async () => {
     assert.equal(p.autoEngineBackend("cuda"), "cuda"); assert.equal(p.autoEngineBackend("vulkan"), "vulkan");
     assert.equal(p.autoEngineBackend(undefined), "cpu"); assert.equal(p.autoEngineBackend("cuda", "windows"), "cuda");
-    const selected = [];
-    const refresh = await expression("components/SettingsPage.tsx", "refreshEngine", { ...p, engineSelection: { current: { userSelected: true } }, config: { llamaBackend: "vulkan" }, detectHardware: async () => ({ recommendedBackend: "cuda" }), getLlamaCppStatus: async () => ({ localBackend: "cuda" }), checkOrphanServer: async () => null, setHardware() {}, setEngineStatus() {}, setDetectedServer() {}, setBackend: value => selected.push(value), setCudaVersion() {} });
-    await refresh(); assert.deepEqual(selected, []);
-    platform("Win32"); await refresh(); assert.deepEqual(selected, []);
+    const selected = [], refreshed = [];
+    // activeEngine 现在由 App 作为 prop 传入（useEngines 派生）；单独抽取该函数时需显式提供，否则会被源码的空 catch 吞掉。
+    const refresh = await expression("components/settings/EngineCard.tsx", "refreshEngine", { ...p, activeEngine: undefined, engineSelection: { current: { userSelected: true } }, config: { llamaBackend: "vulkan" }, detectHardware: async () => ({ recommendedBackend: "cuda" }), getLlamaCppStatus: async () => ({ localBackend: "cuda" }), checkOrphanServer: async () => null, setHardware() {}, setEngineStatus: value => refreshed.push(value), setDetectedServer() {}, setBackend: value => selected.push(value), setCudaVersion() {} });
+    await refresh(); assert.deepEqual(selected, []); assert.equal(refreshed.length, 1);
+    platform("Win32"); await refresh(); assert.deepEqual(selected, []); assert.equal(refreshed.length, 2);
   });
   const release = { tag: "b99999", matchBackend: "vulkan", assets: [], matchAsset: { backend: "vulkan", fileName: "llama-b99999-bin-ubuntu-vulkan-x64.tar.gz", url: "https://example.test/llama-b99999-bin-ubuntu-vulkan-x64.tar.gz", size: 170, sha256: "a".repeat(64) } };
   await test("actual Settings check uses selected backend and exposes missing assets/rate limits with retry", async () => {
     let result = release, failure = null, remote = null, error, checking;
     const seen = [];
-    const ensure = await expression("components/SettingsPage.tsx", "ensureRemote", { ...p, t, backend: "vulkan", cudaVersion: "12", engineStatus: { localVersion: "b1", localBackend: "cpu" }, setChecking: v => checking = v, setEngineError: v => error = v, setRemote: v => remote = v, checkLlamaCppUpdate: async backend => { seen.push(backend); if (failure) throw new Error(failure); return result; } });
+    const ensure = await expression("components/settings/EngineCard.tsx", "ensureRemote", { ...p, t, backend: "vulkan", cudaVersion: "12", engineStatus: { localVersion: "b1", localBackend: "cpu" }, setChecking: v => checking = v, setEngineError: v => error = v, setRemote: v => remote = v, checkLlamaCppUpdate: async backend => { seen.push(backend); if (failure) throw new Error(failure); return result; } });
     assert.equal((await ensure()).tag, "b99999"); assert.equal(checking, false); assert.equal(error, null); assert.equal(remote.upToDate, false);
     result = { ...release, matchAsset: null }; assert.equal(await ensure(), null); assert.match(error, /no trusted asset/); assert.equal(remote, null);
     failure = "HTTP 403 rate limit"; await ensure(undefined, undefined, true); assert.match(error, /403/); assert.equal(checking, false);
@@ -243,21 +280,21 @@ try {
   await test("actual Settings update and reinstall dispatch recheck with explicit force semantics", async () => {
     for (const name of ["startUpdate", "forceReinstall"]) {
       const seen = [];
-      const handler = await expression("components/SettingsPage.tsx", name, { ...p, t, backend: "vulkan", updating: false, remote: null, ensureRemote: async () => release, runUpdate: async (...args) => seen.push(args), setEngineError: assert.fail });
+      const handler = await expression("components/settings/EngineCard.tsx", name, { ...p, t, backend: "vulkan", updating: false, remote: null, ensureRemote: async () => release, runUpdate: async (...args) => seen.push(args), setEngineError: assert.fail });
       await handler(); assert.deepEqual(seen, [name === "forceReinstall" ? ["vulkan", true] : ["vulkan"]]);
     }
   });
   async function updateFixture(overrides = {}) {
     const state = { events: [], logs: [], errors: [], persisted: [], progress: [] };
     const saved = { serverPath: "/managed/new/llama-server", llamacppDir: "/managed/new", llamaBackend: "vulkan", llamaCudaVersion: null, activeEngineId: "manual", engines: [{ id: "manual", path: "/managed/new/llama-server", backend: "vulkan", version: "b99999", cudaVersion: null }], models: [{ id: "concurrent-model" }], network: { proxyMode: "direct" } };
-    const handler = await expression("components/SettingsPage.tsx", "runUpdate", {
+    const handler = await expression("components/settings/EngineCard.tsx", "runUpdate", {
       ...p, t, updating: false, cudaVersion: "12", remote: release, ensureRemote: async () => release,
       config: { serverPath: "/old", llamaCudaVersion: "12", engines: [] },
       window: { setTimeout: fn => fn() },
       setUpdating: v => state.events.push(v), setEngineError: v => state.errors.push(v), setProgress: v => state.progress.push(v),
       downloadLlamaCpp: async args => { state.input = args; return saved.serverPath; },
-      loadConfig: async () => saved, onPersist: async v => state.persisted.push(v), setServerPath: v => state.path = v,
-      setBackend: v => state.backend = v, setEngineStatus: v => state.status = v,
+      loadConfig: async () => saved, onPersist: async v => state.persisted.push(v),
+      setBackend: v => state.backend = v, setCudaVersion() {}, setEngineStatus: v => state.status = v,
       getLlamaCppStatus: async () => ({ localBackend: "vulkan", localVersion: "b99999" }),
       onLog: (...args) => state.logs.push(args), refreshEngine: assert.fail,
       setRemote: value => state.remote = value, ...overrides,
@@ -268,7 +305,10 @@ try {
   await test("actual Settings install adopts complete saved config and updates status", async () => {
     const { state, saved } = await updateFixture();
     assert.deepEqual(state.persisted, [saved]); assert.equal(state.persisted[0], saved);
-    assert.equal(state.path, saved.serverPath); assert.equal(state.backend, "vulkan"); assert.equal(state.status.localVersion, "b99999");
+    // 原断言：SettingsPage 的本地 serverPath 状态被写成安装结果。
+    // v0.4.1：EngineCard 不再持有 serverPath 状态，安装结果整体交给 onPersist（App.persist → config → 卡片），
+    // 所以路径契约改由持久化配置承载：采用安装器返回的路径，而不是安装前的旧路径。
+    assert.equal(state.persisted[0].serverPath, saved.serverPath); assert.notEqual(state.persisted[0].serverPath, "/old"); assert.equal(state.backend, "vulkan"); assert.equal(state.status.localVersion, "b99999");
     assert.deepEqual(state.events, [true, false]); assert.equal(state.input.tag, release.tag); assert.equal(state.remote.upToDate, true); assert.equal(state.progress.at(-1), null); assert.deepEqual(state.errors, [null]);
   });
   await test("actual Settings load failure never persists stale config or reports success", async () => {
@@ -283,17 +323,20 @@ try {
       assert.deepEqual(state.persisted, []); assert.equal(state.events.at(-1), false); assert.equal(state.progress.at(-1), null); assert.ok(state.errors.at(-1));
     }
   });
-  await test("actual Settings Linux UI preserves manual metadata and enables CUDA alongside CPU/Vulkan", () => {
+  await test("actual Settings Linux UI preserves manual metadata and enables CUDA alongside CPU/Vulkan", async () => {
     const props = { visible: true, config: { serverPath: "/manual/cuda", llamaBackend: "cuda", activeEngineId: "cuda", engines: [{ id: "cuda", name: "Manual CUDA", path: "/manual/cuda", backend: "cuda" }] }, onPersist: async () => {}, onLog() {}, onCheckUpdate: async () => update, onExportBackup: async () => {}, onImportBackup: async () => {} };
-    const html = renderToStaticMarkup(React.createElement(Settings, props));
+    // v0.4.1：SettingsPage 只透传 activeEngine（App 用 useEngines 计算），这里同样用真实 hook 派生后再渲染。
+    const useEngines = await expression("hooks/useEngines.ts", "useEngines", { ...p, useMemo: (compute) => compute() });
+    const activeEngine = useEngines({ config: props.config, persist: assert.fail, setToast: assert.fail, t }).activeAppEngine;
+    const html = renderToStaticMarkup(React.createElement(Settings, { ...props, activeEngine }));
     assert.match(html, /Manual CUDA/); assert.match(html, /CPU\/Vulkan\/CUDA/); assert.match(html, /class="cuda-text-btn"/); assert.doesNotMatch(html, /class="cuda-text-btn" disabled=""/); assert.match(html, /cuda-compound-pill active/);
     assert.match(html, /class="engine-primary-btn compact"><[^]*?Check/);
     platform("Linux aarch64");
-    const arm = renderToStaticMarkup(React.createElement(Settings, props));
+    const arm = renderToStaticMarkup(React.createElement(Settings, { ...props, activeEngine }));
     assert.match(arm, /unknown architectures/); assert.match(arm, /class="engine-primary-btn compact" disabled=""/);
   });
-  await appUpdateFixtures({ test, p, bridge, i18n, expression, UpdateDialog, update, platform, calls, globalValue, native });
-  await cudaUiFixtures({ test, p, bridge, i18n, expression, Settings, platform, calls, globalValue, native });
+  await appUpdateFixtures({ test, p, bridge, i18n, expression, UpdateDialog, ChangelogViewer, update, platform, calls, globalValue, native });
+  await cudaUiFixtures({ test, p, bridge, i18n, expression, utils, Settings, platform, calls, globalValue, native });
   console.log(`Passed ${passed} UI/helper fixtures; simulated platform/IPC and SSR, not desktop runtime validation.`);
 } finally {
   for (const [key, descriptor] of Object.entries(descriptors)) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else delete globalThis[key]; }

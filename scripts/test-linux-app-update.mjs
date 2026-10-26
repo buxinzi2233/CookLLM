@@ -4,7 +4,7 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import * as icons from "lucide-react";
 
-export async function appUpdateFixtures({ test, p, bridge, i18n, expression, UpdateDialog, update, platform, calls, globalValue, native }) {
+export async function appUpdateFixtures({ test, p, bridge, i18n, expression, UpdateDialog, ChangelogViewer, update, platform, calls, globalValue, native }) {
   const t = (key) => i18n.formatMessage("en", key);
   const capable = (kind = "appimage") => ({ ...update, installKind: kind, installSupported: true, assetName: `CookLLM.${kind}`, assetUrl: `https://example.test/CookLLM.${kind}`, assetSha256: "a".repeat(64) });
   const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; };
@@ -42,7 +42,7 @@ export async function appUpdateFixtures({ test, p, bridge, i18n, expression, Upd
     const slots = [], effects = [], pending = [];
     let cursor = 0, tree, component, progressHandler, closed = false;
     const deps = {
-      ...p, ...Object.fromEntries(["AlertTriangle", "ArrowRight", "CheckCircle2", "Download", "FileText", "Loader2", "PackageCheck", "RefreshCw", "Rocket", "Sparkles", "X"].map(name => [name, icons[name]])), React, APP_VERSION: "fixture", useI18n: () => ({ t }), formatBytes: String, formatMB: String,
+      ...p, ...Object.fromEntries(["AlertTriangle", "ArrowRight", "CheckCircle2", "Download", "FileText", "Loader2", "PackageCheck", "RefreshCw", "Rocket", "Sparkles", "X"].map(name => [name, icons[name]])), React, APP_VERSION: "fixture", useI18n: () => ({ t }), formatBytes: String, formatMB: String, ChangelogViewer,
       useState(initial) { const index = cursor++; if (!(index in slots)) slots[index] = initial; return [slots[index], next => { slots[index] = typeof next === "function" ? next(slots[index]) : next; }]; },
       useRef(initial) { const index = cursor++; return slots[index] ??= { current: initial }; },
       useEffect(fn, dependencies) { const index = cursor++; const old = effects[index]; if (!old || dependencies.some((value, i) => value !== old.dependencies[i])) { pending.push(() => { old?.cleanup?.(); effects[index] = { dependencies, cleanup: fn() }; }); } },
@@ -122,7 +122,7 @@ export async function appUpdateFixtures({ test, p, bridge, i18n, expression, Upd
   });
   await test("actual Settings progress callback excludes app completion and accepts engine/legacy events", async () => {
     const seen = [], logs = [];
-    const handler = await expression("components/SettingsPage.tsx", "handleEngineProgress", { ...p, active: true, t, setProgress: value => seen.push(value), onLog: value => logs.push(value) });
+    const handler = await expression("components/settings/EngineCard.tsx", "handleEngineProgress", { ...p, active: true, t, setProgress: value => seen.push(value), onLog: value => logs.push(value) });
     handler({ source: "app", phase: "done" }); assert.equal(seen.length, 0); assert.equal(logs.length, 0);
     handler({ source: "engine", phase: "done" }); handler({ phase: "done" }); assert.equal(seen.length, 2); assert.equal(logs.length, 2);
   });

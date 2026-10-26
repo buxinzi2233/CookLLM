@@ -11,6 +11,19 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const temp = await mkdtemp(join(tmpdir(), "cookllm-path-tests-"));
 const storageDescriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
 Object.defineProperty(globalThis, "localStorage", { configurable: true, value: { getItem: () => null } });
+// getPlatform() 只读运行环境（navigator）：与 localStorage 同一手法按需注入平台分支，
+// 不复制被测算法、不改写被测源码，也不依赖测试机自身的平台。
+const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+function asPlatform(platform, run) {
+  const hint = platform === "windows" ? "Win32" : platform === "macos" ? "MacIntel" : "Linux x86_64";
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: { platform: hint } });
+  try {
+    return run();
+  } finally {
+    if (navigatorDescriptor) Object.defineProperty(globalThis, "navigator", navigatorDescriptor);
+    else delete globalThis.navigator;
+  }
+}
 const compilerOptions = { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext };
 let passed = 0;
 async function test(name, run) {
@@ -59,17 +72,17 @@ try {
   await test("Windows identity remains case-insensitive without altering stored paths", () => {
     assert.equal(pathIdentity("C:\\模型 空格\\Model.gguf", "windows"), pathIdentity("c:\\模型 空格\\model.gguf", "windows"));
     assert.equal(fileName("C:\\模型 空格\\Model.gguf", "windows"), "Model.gguf");
-    assert.equal(defaultProfilesForModel("/models/Test.NINFER")[0].kvDtype, "rk8v4");
+    assert.equal(defaultProfilesForModel("/models/Test.NINFER")[0].kvDtype, "k8v4");
   });
   await test("real config merge keeps Linux case variants and merges Windows profiles", () => {
     const current = config([model("local", upper)]);
     const incoming = config([model("backup", lower, [DEFAULT_PROFILES[1]])]);
-    const linux = mergeImportedConfig(current, incoming, new Set(), "linux");
-    assert.equal(linux.added, 1);
+    const linux = asPlatform("linux", () => mergeImportedConfig(current, incoming, new Set(), { missingPathStrategy: "keep" }));
+    assert.equal(linux.addedModels, 1);
     assert.deepEqual(linux.config.models.map((m) => m.path), [upper, lower]);
-    const windows = mergeImportedConfig(current, incoming, new Set(), "windows");
-    assert.equal(windows.added, 0);
-    assert.equal(windows.updated, 1);
+    const windows = asPlatform("windows", () => mergeImportedConfig(current, incoming, new Set(), { missingPathStrategy: "keep" }));
+    assert.equal(windows.addedModels, 0);
+    assert.equal(windows.updatedModels, 1);
     assert.equal(windows.config.models[0].id, "local");
     assert.equal(windows.config.models[0].path, upper);
     assert.equal(windows.config.models[0].profiles.length, 2);
@@ -77,21 +90,23 @@ try {
   });
   await test("real merge deduplicates repeated incoming paths and accumulates profiles", () => {
     const incoming = config([model("a", upper), model("b", upper, [DEFAULT_PROFILES[1]]), model("c", upper, [DEFAULT_PROFILES[2]])]);
-    const merged = mergeImportedConfig(config(), incoming, new Set(), "linux");
-    assert.equal(merged.added, 1);
+    const merged = asPlatform("linux", () => mergeImportedConfig(config(), incoming, new Set(), { missingPathStrategy: "keep" }));
+    assert.equal(merged.addedModels, 1);
     assert.equal(merged.config.models.length, 1);
     assert.equal(merged.config.models[0].profiles.length, 3);
   });
   await test("missing-path sets use the same identity and never activate a missing imported engine", () => {
     const engine = { id: "missing-engine", name: "engine", path: "/Engine" };
     const incoming = config([model("upper", upper), model("lower", lower)], { serverPath: engine.path, engines: [engine], activeEngineId: engine.id });
-    const missing = new Set([upper, engine.path]);
-    const linux = mergeImportedConfig(config(), incoming, missing, "linux");
+    // 调用方（备份导入）按目标平台身份归一化缺失路径集合：这里用同一身份构造，与 src/components/BackupImportModal.tsx 一致
+    const missingFor = (platform) => new Set([upper, engine.path].map((path) => pathIdentity(path, platform)));
+    const linux = asPlatform("linux", () => mergeImportedConfig(config(), incoming, missingFor("linux"), { missingPathStrategy: "skip" }));
     assert.deepEqual(linux.config.models.map((m) => m.path), [lower]);
     assert.equal(linux.config.serverPath, "");
     assert.equal(linux.config.activeEngineId, undefined);
     assert.deepEqual(linux.config.engines, []);
-    assert.equal(mergeImportedConfig(config(), incoming, missing, "windows").config.models.length, 0);
+    const windows = asPlatform("windows", () => mergeImportedConfig(config(), incoming, missingFor("windows"), { missingPathStrategy: "skip" }));
+    assert.equal(windows.config.models.length, 0);
   });
   await test("empty desktop defaults and legacy user paths survive migration", () => {
     assert.equal(migrateConfig(structuredClone(EMPTY_CONFIG)).serverPath, "");
@@ -102,7 +117,7 @@ try {
       assert.equal(migrated.engines[0].path, path);
     }
     const spaced = upper + " ";
-    const merged = mergeImportedConfig(config([model("a", upper)]), config([model("b", spaced)]), new Set(), "linux");
+    const merged = asPlatform("linux", () => mergeImportedConfig(config([model("a", upper)]), config([model("b", spaced)]), new Set(), { missingPathStrategy: "keep" }));
     assert.deepEqual(merged.config.models.map((m) => m.path), [upper, spaced]);
   });
   await test("real model record removal respects Linux and Windows identities", () => {
@@ -129,10 +144,11 @@ try {
     assert.match(failed.errors[0], /denied/);
   });
 
-  // Execute the actual App closure (AST extraction, no copied algorithm or React renderer).
+  // Execute the actual download/delete closure (AST extraction, no copied algorithm or React renderer).
+  // v0.4.1 模块化后 deleteTasksImpl / launchDownload 由 src/hooks/useDownloads.ts 持有（App.tsx 只消费）。
   // Only UI state and native I/O are injected; data/path/deletion helpers above are real modules.
-  const appText = await readFile(join(root, "src/App.tsx"), "utf8");
-  const appAst = ts.createSourceFile("App.tsx", appText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const appText = await readFile(join(root, "src/hooks/useDownloads.ts"), "utf8");
+  const appAst = ts.createSourceFile("useDownloads.ts", appText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   function appFunction(name, deps) {
     let initializer;
     function visit(node) {
@@ -140,7 +156,7 @@ try {
       ts.forEachChild(node, visit);
     }
     visit(appAst);
-    assert.ok(initializer, `${name} must exist in App.tsx`);
+    assert.ok(initializer, `${name} must exist in src/hooks/useDownloads.ts`);
     const { outputText } = ts.transpileModule(`const implementation = ${initializer.getText(appAst)};`, { compilerOptions });
     return new Function(...Object.keys(deps), `${outputText}\nreturn implementation;`)(...Object.values(deps));
   }

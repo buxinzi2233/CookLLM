@@ -5,7 +5,7 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import * as icons from "lucide-react";
 
-export async function cudaUiFixtures({ test, p, bridge, i18n, expression, platform, calls, globalValue, native }) {
+export async function cudaUiFixtures({ test, p, bridge, i18n, expression, utils, Settings, platform, calls, globalValue, native }) {
   const t = (key, vars) => i18n.formatMessage("en", key, vars);
   const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; };
   const tick = () => new Promise(resolve => setImmediate(resolve));
@@ -21,7 +21,7 @@ export async function cudaUiFixtures({ test, p, bridge, i18n, expression, platfo
   async function ensureFixture(overrides = {}) {
     const state = { remote: null, error: null, checking: false, seen: [] };
     const engineSelection = selection(), engineOperation = operation();
-    const ensure = await expression("components/SettingsPage.tsx", "ensureRemote", {
+    const ensure = await expression("components/settings/EngineCard.tsx", "ensureRemote", {
       ...p, t, engineSelection, engineOperation, engineStatus: local("12.7"),
       setRemote: value => state.remote = value, setEngineError: value => state.error = value,
       setChecking: value => state.checking = value, setCheckResult() {},
@@ -103,8 +103,8 @@ export async function cudaUiFixtures({ test, p, bridge, i18n, expression, platfo
   await test("hardware recommendation and stored preference select CUDA only on supported Linux x64", async () => {
     for (const preferred of [undefined, "cuda", "vulkan"]) {
       const engineSelection = selection("cpu"), choices = [], checks = [];
-      const refresh = await expression("components/SettingsPage.tsx", "refreshEngine", {
-        ...p, config: { llamaBackend: preferred }, engineSelection, engineOperation: operation(),
+      const refresh = await expression("components/settings/EngineCard.tsx", "refreshEngine", {
+        ...p, activeEngine: undefined, config: { llamaBackend: preferred }, engineSelection, engineOperation: operation(),
         detectHardware: async () => ({ recommendedBackend: "cuda" }), getLlamaCppStatus: async () => local(), checkOrphanServer: async () => null,
         setHardware() {}, setEngineStatus() {}, setDetectedServer() {}, setBackend: v => choices.push(v), setCudaVersion() {},
         ensureRemote: async (...args) => checks.push(args),
@@ -114,7 +114,7 @@ export async function cudaUiFixtures({ test, p, bridge, i18n, expression, platfo
     }
     platform("Linux aarch64");
     const choices = [];
-    const refresh = await expression("components/SettingsPage.tsx", "refreshEngine", { ...p, config: {}, engineSelection: selection("cpu"), engineOperation: operation(), detectHardware: async () => ({ recommendedBackend: "cuda" }), getLlamaCppStatus: async () => local(), checkOrphanServer: async () => null, setHardware() {}, setEngineStatus() {}, setDetectedServer() {}, setBackend: v => choices.push(v), setCudaVersion() {}, ensureRemote: async () => null });
+    const refresh = await expression("components/settings/EngineCard.tsx", "refreshEngine", { ...p, activeEngine: undefined, config: {}, engineSelection: selection("cpu"), engineOperation: operation(), detectHardware: async () => ({ recommendedBackend: "cuda" }), getLlamaCppStatus: async () => local(), checkOrphanServer: async () => null, setHardware() {}, setEngineStatus() {}, setDetectedServer() {}, setBackend: v => choices.push(v), setCudaVersion() {}, ensureRemote: async () => null });
     await refresh(); assert.deepEqual(choices, ["cpu"]);
   });
 
@@ -122,12 +122,12 @@ export async function cudaUiFixtures({ test, p, bridge, i18n, expression, platfo
     const state = { inputs: [], persisted: [], progress: [], errors: [], logs: [], timers: [] };
     const saved = { serverPath: "/fixture/managed/new/llama-server", llamacppDir: "/fixture/managed/new", llamaBackend: "cuda", llamaCudaVersion: "auto", activeEngineId: "old", engines: [{ id: "old", path: "/fixture/managed/new/llama-server", backend: "cuda", cudaVersion: "12.8", version: "b99999", name: "retained name" }], models: [{ id: "new-model" }], profiles: [{ id: "retained-profile" }], network: { proxyMode: "direct" } };
     const engineSelection = selection(), engineOperation = operation();
-    const handler = await expression("components/SettingsPage.tsx", "runUpdate", {
+    const handler = await expression("components/settings/EngineCard.tsx", "runUpdate", {
       ...p, t, engineSelection, engineOperation, updating: false, cudaVersion: "auto", remote: release("13.0", "b99998"), config: { serverPath: "/fixture/old" },
       ensureRemote: async (...args) => { state.check = args; return release(); },
       engineDownloadInfo: bridge.engineDownloadInfo, setUpdating: value => state.updating = value, setEngineError: value => state.errors.push(value), setProgress: value => state.progress.push(value),
       downloadLlamaCpp: async input => { state.inputs.push(input); return saved.serverPath; }, loadConfig: async () => saved,
-      onPersist: async value => state.persisted.push(value), setServerPath: value => state.path = value, setBackend: value => state.backend = value, setEngineStatus() {},
+      onPersist: async value => state.persisted.push(value), setBackend: value => state.backend = value, setCudaVersion() {}, setEngineStatus() {},
       getLlamaCppStatus: async () => local(), setRemote: value => state.remote = value, onLog: (...args) => state.logs.push(args), refreshEngine: assert.fail,
       window: { setTimeout: fn => state.timers.push(fn) }, ...overrides,
     });
@@ -139,7 +139,11 @@ export async function cudaUiFixtures({ test, p, bridge, i18n, expression, platfo
     assert.deepEqual(state.check, ["cuda", "auto"]);
     assert.deepEqual(state.inputs, [{ backend: "cuda", cudaVersion: "auto", tag: value.tag, assetUrl: value.matchAsset.url, assetName: value.matchAsset.fileName }]);
     assert.equal(state.progress[0].total, 766); assert.equal(state.persisted[0], saved);
-    assert.equal(state.path, saved.serverPath); assert.equal(state.backend, "cuda"); assert.equal(state.remote.matchAsset.cudaFullVersion, "12.8");
+    // 原断言：SettingsPage 的本地 serverPath 状态被写成安装结果。
+    // v0.4.1：EngineCard 不再持有 serverPath 状态，安装结果整体交给 onPersist（App.persist → config → 卡片），
+    // 所以路径契约改由持久化配置承载：采用安装器返回的路径，而不是安装前的旧路径。
+    assert.equal(state.persisted[0].serverPath, saved.serverPath); assert.notEqual(state.persisted[0].serverPath, "/fixture/old");
+    assert.equal(state.backend, "cuda"); assert.equal(state.remote.matchAsset.cudaFullVersion, "12.8");
     assert.equal(state.remote.upToDate, true); assert.equal(state.updating, false);
   });
   await test("Linux CUDA install sends original preference while fresh asset fields lock the installed version", async () => {
@@ -214,8 +218,8 @@ export async function cudaUiFixtures({ test, p, bridge, i18n, expression, platfo
     let cursor = 0, tree, component, progressHandler;
     const props = { visible: true, config: { serverPath: "", ...config }, appUpdate: null, checkingUpdate: false, onPersist: async value => saved.push(value), onLog() {}, onCheckUpdate: async () => null, onExportBackup: async () => {}, onImportBackup: async () => {} };
     const deps = {
-      ...p, ...bridge, ...Object.fromEntries("Activity AlertTriangle ArrowRight Check ChevronDown ChevronRight Cpu Download Eye EyeOff FolderOpen Github KeyRound Languages Loader2 Moon Pencil Plus RefreshCw RotateCw Search SlidersHorizontal Sparkles Star Sun Trash2 Upload Wifi Wrench X Zap".split(" ").map(name => [name, icons[name]])), React, APP_REPO: "fixture/repo", PROJECT_URL: "https://example.test", EngineModal: () => null, ConfirmModal: () => null,
-      useI18n: () => ({ t }), cn: (...values) => values.filter(Boolean).join(" "), formatBytes: value => `${value} B`, formatMB: String, formatEngineBackend: value => value || "CPU",
+      ...p, ...bridge, ...Object.fromEntries("Activity AlertTriangle ArrowRight Check ChevronDown ChevronRight Cpu Download Eye EyeOff FolderOpen Github Info KeyRound Languages Loader2 Moon Pencil Plus RefreshCw RotateCw Search Settings SlidersHorizontal Sparkles Star Sun Trash2 Upload Wifi Wrench X Zap".split(" ").map(name => [name, icons[name]])), React, APP_REPO: "fixture/repo", PROJECT_URL: "https://example.test", EngineModal: () => null, ConfirmModal: () => null,
+      useI18n: () => ({ t }), cn: (...values) => values.filter(Boolean).join(" "), formatBytes: value => `${value} B`, formatMB: String, formatEngineBackend: value => value || "CPU", getEngineTypeDisplay: utils.getEngineTypeDisplay,
       useState(initial) { const index = cursor++; if (!(index in slots)) slots[index] = initial; return [slots[index], value => { slots[index] = typeof value === "function" ? value(slots[index]) : value; }]; },
       useRef(initial) { const index = cursor++; return slots[index] ??= { current: initial }; },
       useEffect(fn, dependencies) { const index = cursor++; const old = effects[index]; if (!old || dependencies.some((value, i) => value !== old.dependencies[i])) pending.push(() => { old?.cleanup?.(); effects[index] = { dependencies, cleanup: fn() }; }); },
@@ -225,7 +229,8 @@ export async function cudaUiFixtures({ test, p, bridge, i18n, expression, platfo
       onDownloadProgress: async fn => { progressHandler = fn; return () => {}; },
       window: { setTimeout: fn => timers.push(fn), clearTimeout() {}, addEventListener() {}, removeEventListener() {} }, ...overrides,
     };
-    component = await expression("components/SettingsPage.tsx", "SettingsPage", deps);
+    // v0.4.1：引擎选择/更新状态与 UI 已从 SettingsPage 迁到 components/settings/EngineCard.tsx。
+    component = await expression("components/settings/EngineCard.tsx", "EngineCard", deps);
     const render = () => { cursor = 0; tree = component(props); pending.splice(0).forEach(fn => fn()); return tree; };
     const buttons = node => !node || typeof node !== "object" ? [] : [...(node.type === "button" ? [node] : []), ...React.Children.toArray(node.props?.children).flatMap(buttons)];
     const click = predicate => { const button = buttons(render()).find(predicate); assert.ok(button, "Settings button found"); assert.ok(!button.props.disabled, "Settings button enabled"); button.props.onClick({ stopPropagation() {} }); render(); };
@@ -261,7 +266,7 @@ export async function cudaUiFixtures({ test, p, bridge, i18n, expression, platfo
   });
   await test("Settings engine progress ignores app source, idle events and callbacks after cleanup", async () => {
     const seen = [], engineOperation = operation(); engineOperation.current.active = true;
-    const handler = await expression("components/SettingsPage.tsx", "handleEngineProgress", { ...p, t, active: true, engineOperation, setProgress: value => seen.push(value), onLog() {} });
+    const handler = await expression("components/settings/EngineCard.tsx", "handleEngineProgress", { ...p, t, active: true, engineOperation, setProgress: value => seen.push(value), onLog() {} });
     handler({ source: "app", phase: "download" }); assert.equal(seen.length, 0);
     handler({ source: "engine", phase: "download" }); assert.equal(seen.length, 1);
     engineOperation.current.active = false; handler({ source: "engine", phase: "done" }); assert.equal(seen.length, 1);

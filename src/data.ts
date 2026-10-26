@@ -175,6 +175,8 @@ export function mergeImportedConfig(
     const existing = (path ? byPath.get(pathIdentity(path)) : undefined) || byId.get(raw.id);
     if (!existing) {
       models.push(raw);
+      // 同一份备份内重复路径必须去重：登记新条目，后续同路径条目改为补齐预设而不是重复入库
+      if (path) byPath.set(pathIdentity(path), raw);
       addedModels += 1;
       continue;
     }
@@ -216,13 +218,16 @@ export function mergeImportedConfig(
     }
 
     if (modelChanged) {
-      models[existingIndex] = {
+      const mergedModel: ModelAsset = {
         ...existing,
         displayName,
         defaultProfileId,
         profiles: mergedProfiles,
         tags: mergedTags.length ? mergedTags : undefined,
       };
+      models[existingIndex] = mergedModel;
+      // 保持路径索引与已合并条目同步：同一份备份里第三条同路径记录必须看到前两条累加的预设
+      byPath.set(pathIdentity(mergedModel.path), mergedModel);
       updatedModels += 1;
     }
   }
@@ -241,13 +246,22 @@ export function mergeImportedConfig(
     }
   }
 
+  // 跳过缺失路径时不得激活被跳过的引擎：serverPath / activeEngineId 只在对应条目真正保留时才导入。
+  // （keep 策略保留缺失条目供用户重设路径，行为与上游一致；skip 策略下被跳过的路径不得写回配置。）
+  const skippedServerPath = Boolean(incoming.serverPath) && missingPathStrategy === "skip" && isMissing(incoming.serverPath);
+  const incomingActiveEngine = incoming.activeEngineId
+    ? engines.find((engine) => engine.id === incoming.activeEngineId)
+    : undefined;
+  const skippedActiveEngine = Boolean(incoming.activeEngineId) && missingPathStrategy === "skip"
+    && (!incomingActiveEngine || isMissing(incomingActiveEngine.path));
+
   const mergedConfig: AppConfig = {
     ...current,
     models,
     engines,
     customTags: Array.from(new Set([...(current.customTags || []), ...(incoming.customTags || [])])),
-    serverPath: current.serverPath || incoming.serverPath,
-    activeEngineId: current.activeEngineId || incoming.activeEngineId,
+    serverPath: current.serverPath || (skippedServerPath ? "" : incoming.serverPath),
+    activeEngineId: current.activeEngineId || (skippedActiveEngine ? undefined : incoming.activeEngineId),
   };
 
   if (importAppSettings) {
