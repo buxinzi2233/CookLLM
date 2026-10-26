@@ -1,6 +1,7 @@
 import type { InferenceMetrics, LlamaLogPayload, ModelAsset } from "./types";
 import { formatMessage, getLocale } from "./i18n";
-import { writeClipboard } from "./tauri";
+import { writeClipboard, removeLocalFile } from "./tauri";
+import { getPlatform, type Platform } from "./platform";
 
 export const ACCENTS = ["violet", "cyan", "amber", "rose"] as const;
 export const EMPTY_STATUS = { running: false } as const;
@@ -28,8 +29,19 @@ export function formatMB(bytes: number): string {
   return `${mb.toFixed(mb >= 100 ? 0 : 1)} MB`;
 }
 
-export function fileName(path: string) {
-  return path.split(/[\\/]/).pop() || path;
+export function fileName(path: string, platform: Platform = getPlatform()) {
+  return path.split(platform === "windows" ? /[\\/]/ : /\//).pop() || path;
+}
+
+/** 同时等待目标文件和断点文件的删除结果；保留部分成功与每个失败的路径。 */
+export async function removeDownloadFiles(path: string, removeFile: (path: string) => Promise<void> = removeLocalFile): Promise<{ removedPaths: string[]; errors: string[] }> {
+  if (!path) return { removedPaths: [], errors: ["Missing download file path"] };
+  const paths = [path, path + ".part"];
+  const results = await Promise.allSettled(paths.map((file) => removeFile(file)));
+  return {
+    removedPaths: results[0].status === "fulfilled" ? [path] : [],
+    errors: results.flatMap((result, index) => result.status === "rejected" ? [`${paths[index]}: ${String(result.reason)}`] : []),
+  };
 }
 
 export type EngineTypeKey = "llamacpp" | "ninfer" | "ninfer_kvmem";
@@ -38,7 +50,7 @@ export type EngineTypeKey = "llamacpp" | "ninfer" | "ninfer_kvmem";
 export function detectEngineType(path?: string): EngineTypeKey {
   if (!path) return "llamacpp";
   const lower = path.toLowerCase();
-  const file = lower.split(/[\/\\]/).pop() || lower;
+  const file = fileName(lower);
   if (file.includes("ninfer") && (file.includes("kvmem") || lower.includes("kvmem"))) {
     return "ninfer_kvmem";
   }

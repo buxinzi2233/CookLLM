@@ -2,6 +2,8 @@ import { getVersion as appVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { APP_REPO, APP_VERSION, PROJECT_URL } from "./data";
+import { canAutoInstallApp, canAutoInstallEngine, autoEngineBackend, getPlatform, isHttpUrl } from "./platform";
+import { formatMessage, getLocale } from "./i18n";
 import { isNewerVersion } from "./utils";
 import type { AppConfig, DiskUsage, GpuStats, HfDownloadResult, HfFile, HfModel, LlamaLogPayload, ModelDownloadProgress, ServerStatus } from "./types";
 
@@ -161,8 +163,13 @@ export async function openConfigDir(): Promise<void> {
   if (isTauri()) { await invoke("open_config_dir"); }
 }
 export async function openExternal(url: string): Promise<void> {
+  if (!isHttpUrl(url)) throw new Error(formatMessage(getLocale(), "pg.httpOnly"));
   if (isTauri()) { await invoke("open_url", { url }); }
-  else { window.open(url, "_blank"); }
+  else {
+    const opened = window.open(url, "_blank");
+    if (!opened) throw new Error(formatMessage(getLocale(), "pg.popupBlocked"));
+    opened.opener = null;
+  }
 }
 
 /** 按应用主题同步系统标题栏：Windows 暗色主题显示黑色标题栏，亮色恢复默认。 */
@@ -189,7 +196,16 @@ export interface UpdateCheckResult {
   assetName?: string | null;
   assetSize?: number | null;
   assetSha256?: string | null;
+  installKind?: "appimage" | "deb" | "rpm" | "manual";
+  installSupported?: boolean;
+  installReason?: string;
 }
+
+export type AppInstallResult = null | {
+  status: "restarting" | "installer-opened";
+  message: string;
+  backupPath?: string;
+};
 
 /** 通过 GitHub Releases 检查新版本（匿名访问，无需密钥）；仓库无已发布版本时抛 Error("no-releases") */
 export async function checkForUpdate(currentVersion: string): Promise<UpdateCheckResult> {
@@ -212,8 +228,9 @@ export async function checkForUpdate(currentVersion: string): Promise<UpdateChec
 }
 
 export async function downloadAppUpdate(update: UpdateCheckResult): Promise<string> {
+  if (!canAutoInstallApp(getPlatform(), update)) throw new Error(update?.installReason || formatMessage(getLocale(), "linux.manualUpdate"));
   if (!isTauri()) throw new Error("仅 Tauri 桌面端可用");
-  if (!update.assetUrl || !update.assetName) throw new Error("未找到 Windows 安装包");
+  if (!update.assetUrl || !update.assetName) throw new Error(formatMessage(getLocale(), "update.assetMissing"));
   return invoke<string>("download_app_update", {
     url: update.assetUrl,
     fileName: update.assetName,
@@ -227,9 +244,10 @@ export async function cancelAppUpdate(): Promise<void> {
   await invoke("cancel_app_update");
 }
 
-export async function installAppUpdate(path: string): Promise<void> {
+export async function installAppUpdate(path: string, update?: UpdateCheckResult): Promise<AppInstallResult> {
+  if (!canAutoInstallApp(getPlatform(), update)) throw new Error(update?.installReason || formatMessage(getLocale(), "linux.manualUpdate"));
   if (!isTauri()) throw new Error("仅 Tauri 桌面端可用");
-  await invoke("install_app_update", { path });
+  return invoke<AppInstallResult>("install_app_update", { path });
 }
 
 /* ==================== 硬件探测（阶段一） ==================== */
@@ -283,12 +301,13 @@ export interface LlamaCppAsset {
   fileName: string;
   url: string;
   size: number;
+  sha256?: string | null;
 }
 
 export interface LlamaCppRelease {
   tag: string;
   assets: LlamaCppAsset[];
-  /** 对应的 CUDA 运行时包（cudart-...zip），仅 cuda 后端有值 */
+  /** 官方同 tag 的 CUDA 运行库；Linux tar.gz / Windows zip */
   cudartAssets?: LlamaCppAsset[];
   matchBackend: string;
   matchAsset?: LlamaCppAsset | null;
@@ -307,6 +326,7 @@ export interface LlamaCppLocalStatus {
 }
 
 export interface DownloadProgress {
+  source?: "app" | "engine";
   phase: "download" | "extract" | "install" | "done" | string;
   percent: number;
   downloaded: number;
@@ -315,16 +335,45 @@ export interface DownloadProgress {
   message: string;
 }
 
+/** 使用后端精确 matchAsset；Linux CUDA 仅接受同 tag / 完整版本 / x64 的唯一运行库。 */
+export function engineDownloadInfo(release: LlamaCppRelease, platform = getPlatform()) {
+  const engine = release.matchAsset;
+  if (!engine) throw new Error(formatMessage(getLocale(), "linux.assetMissing"));
+  if (engine.backend !== "cuda" || platform !== "linux") return { engine, runtime: null, total: engine.size };
+  const full = engine.cudaFullVersion ?? "";
+  const name = `llama-${release.tag}-bin-ubuntu-cuda-${full}-x64.tar.gz`;
+  const pairs = (release.cudartAssets ?? []).filter(asset => asset.cudaFullVersion === full);
+  const valid = (asset: LlamaCppAsset) => asset.backend === "cuda"
+    && asset.cudaVersion === full.split(".")[0] && Number.isSafeInteger(asset.size) && asset.size > 0
+    && /^[a-f0-9]{64}$/i.test(asset.sha256 ?? "") && !!asset.url;
+  const runtime = pairs[0];
+  if (!/^(12|13)\.\d+$/.test(full) || engine.fileName !== name || !valid(engine)
+    || pairs.length !== 1 || !runtime || runtime.fileName !== `cudart-${name}` || !valid(runtime)) {
+    throw new Error(formatMessage(getLocale(), "linux.cudaPairMissing", { version: full || "?" }));
+  }
+  return { engine, runtime, total: engine.size + runtime.size };
+}
+
+/** tag、后端与 CUDA 完整版本必须全部相同；旧主版本配置不是安装版本证据。 */
+export function engineReleaseUpToDate(release: LlamaCppRelease, local: LlamaCppLocalStatus | null, backend: string): boolean {
+  return !!local?.serverAvailable && !!local.localVersion
+    && local.localBackend === backend && release.tag.toLowerCase() === local.localVersion.toLowerCase()
+    && (backend !== "cuda" || (!!release.matchAsset?.cudaFullVersion
+      && local.cudaVersion === release.matchAsset.cudaFullVersion));
+}
+
 /** 读取本地 llama.cpp 安装状态（版本 / 后端 / 可执行文件）；支持传入自定义路径或留空读取主引擎 */
 export async function getLlamaCppStatus(customPath?: string | null): Promise<LlamaCppLocalStatus | null> {
   if (!isTauri()) return null;
   return invoke<LlamaCppLocalStatus>("get_llamacpp_status", { customPath: customPath ?? null });
 }
 
-/** 检查远程最新版本并匹配指定后端的 Windows 构建资产 */
+/** 检查远程最新版本并匹配指定平台与后端的构建资产 */
 export async function checkLlamaCppUpdate(backend?: string, cudaVersion?: string): Promise<LlamaCppRelease> {
+  const requested = backend ?? (getPlatform() === "linux" ? autoEngineBackend() : undefined);
+  if (!canAutoInstallEngine(getPlatform(), requested)) throw new Error(formatMessage(getLocale(), "linux.engineGate"));
   if (!isTauri()) throw new Error("仅 Tauri 桌面端可用");
-  const payload = { ...(backend ? { backend } : {}), ...(cudaVersion ? { cudaVersion } : {}) };
+  const payload = { ...(requested ? { backend: requested } : {}), ...(cudaVersion ? { cudaVersion } : {}) };
   return invoke<LlamaCppRelease>("check_llamacpp_update", payload);
 }
 
@@ -336,6 +385,7 @@ export async function downloadLlamaCpp(input: {
   assetName?: string;
   tag?: string;
 }): Promise<string> {
+  if (!canAutoInstallEngine(getPlatform(), input.backend)) throw new Error(formatMessage(getLocale(), "linux.engineGate"));
   if (!isTauri()) throw new Error("仅 Tauri 桌面端可用");
   return invoke<string>("download_llamacpp", {
     backend: input.backend,

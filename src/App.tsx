@@ -1,14 +1,15 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { DEMO_CONFIG, DEFAULT_PROFILES, DEFAULT_NINFER_PROFILES, defaultProfilesForModel, INITIAL_LOGS, mergeImportedConfig, migrateConfig, uid } from "./data";
+import { DEMO_CONFIG, EMPTY_CONFIG, DEFAULT_PROFILES, DEFAULT_NINFER_PROFILES, defaultProfilesForModel, INITIAL_LOGS, mergeImportedConfig, migrateConfig, removeModelsAtPaths, uid } from "./data";
+import { getPlatform, pathIdentity } from "./platform";
 import { setLocale, useI18n } from "./i18n";
-import { checkForUpdate, checkOrphanServer, exportConfigBackup, getGpuStats, getModelsDir, getServerStatus, hfCancelDownload, hfClearDownload, hfDownload, hfDownloadUrl, hfPauseDownload, inspectGguf, isTauri, killOrphanServer, loadConfig, onLlamaLog, openExternal, pathsExist, pickConfigBackup, pickModelsDir, removeLocalFile, revealInFolder, saveConfig, setWindowTheme, startServer, stopServer, type OrphanProcessItem, type UpdateCheckResult } from "./tauri";
+import { checkForUpdate, checkOrphanServer, exportConfigBackup, getGpuStats, getModelsDir, getServerStatus, hfCancelDownload, hfClearDownload, hfDownload, hfDownloadUrl, hfPauseDownload, inspectGguf, isTauri, killOrphanServer, loadConfig, onLlamaLog, openExternal, pathsExist, pickConfigBackup, pickModelsDir, revealInFolder, saveConfig, setWindowTheme, startServer, stopServer, type OrphanProcessItem, type UpdateCheckResult } from "./tauri";
 import type { ActiveDownload } from "./components/ExplorePage";
 import type { PickedFile } from "./tauri";
 import { onModelDownloadProgress } from "./tauri";
 import type { DiskUsage, ModelDownloadProgress } from "./types";
 import { PAGE_LOG_MODE, type AppConfig, type GpuStats, type InferenceMetrics, type LlamaLogPayload, type ModelAsset, type Page, type Profile, type ServerStatus, type TokSample } from "./types";
-import { ACCENTS, EMPTY_STATUS, cn, fileName, modelTitle, newLog, parseQuantization, parseTokPerSec, shallowEqualFields, InferenceTracker } from "./utils";
+import { ACCENTS, EMPTY_STATUS, cn, fileName, modelTitle, newLog, removeDownloadFiles, parseQuantization, parseTokPerSec, shallowEqualFields, InferenceTracker } from "./utils";
 import LogDock from "./components/LogDock";
 import { LogsPage, Sidebar, Toast, Topbar } from "./components/Layout";
 import ImportModelModal from "./components/ImportModelModal";
@@ -44,7 +45,7 @@ function loadStoredDownloads(): ActiveDownload[] {
 export default function App() {
   /** 界面语言：文案经 t() 查当前 locale；locale 由 AppConfig.language 驱动（adopt/persist 时同步） */
   const { t } = useI18n();
-  const [config, setConfig] = useState<AppConfig>(DEMO_CONFIG);
+  const [config, setConfig] = useState<AppConfig>(() => isTauri() ? { ...EMPTY_CONFIG, models: [], engines: [] } : DEMO_CONFIG);
   /** config 镜像：下载完成回调等长周期闭包读取最新配置，避免用过期快照覆盖用户中途的修改 */
   const configRef = useRef(config);
   configRef.current = config;
@@ -111,6 +112,8 @@ export default function App() {
   };
   const pauseRequestedRef = useRef<Set<string>>(new Set());
   const cancelledTaskIdsRef = useRef<Set<string>>(new Set());
+  const deletingTaskIdsRef = useRef<Set<string>>(new Set());
+  const downloadRunsRef = useRef(new Map<string, Promise<string | undefined>>());
 
   const clearProgressKey = (repo: string, file: string) => {
     const key = repo + "::" + file;
@@ -157,7 +160,7 @@ export default function App() {
   const activeAppEngine = useMemo(() => {
     return (
       appEngines.find((e) => e.id === config.activeEngineId) ||
-      appEngines.find((e) => e.path.toLowerCase() === (config.serverPath || "").toLowerCase()) ||
+      appEngines.find((e) => pathIdentity(e.path) === pathIdentity(config.serverPath || "")) ||
       appEngines[0]
     );
   }, [appEngines, config.activeEngineId, config.serverPath]);
@@ -444,9 +447,12 @@ export default function App() {
     void setWindowTheme(theme === "dark");
   }, [theme]);
 
-  /** 首帧完成渲染后显示窗口：使用双 requestAnimationFrame 确保 React DOM 真正绘制到 WebView2 缓冲区后再显示窗口，彻底消除黑屏与闪烁 */
+  /** Windows 等待双帧减少闪烁；WebKitGTK 隐藏窗口会暂停帧回调，Linux 先显示再记录首帧。 */
   useLayoutEffect(() => {
     if (!isTauri()) return;
+    if (getPlatform() === "linux") {
+      void invoke("show_main_window").catch((error) => console.error("显示主窗口失败", error));
+    }
     let cancelled = false;
     let count = 0;
     const checkFrame = () => {
@@ -533,16 +539,21 @@ export default function App() {
   /** 启动一次通用下载启动器：仓库文件 / 直链统一走这里（自动续传 / 恢复 / 重试复用）。
    *  每次都以唯一 taskId 发起，后端按 taskId 注册独立控制器，取消 / 暂停不会串扰其他任务。 */
   const launchDownload = (entry: ActiveDownload) => {
+    if (deletingTaskIdsRef.current.has(entry.taskId)) return;
     pauseRequestedRef.current.delete(entry.taskId);
-    void (async () => {
+    const pendingRun = (async () => {
       // 必须先等摘除旧控制器完成、再发起下载：两个 invoke 若乱序，hf_clear_download 会把
       // 刚注册的新控制器摘掉，此后暂停 / 取消永远找不到控制器（孤儿循环停不下来）
       try { await hfClearDownload(entry.taskId); } catch { /* 旧控制器不存在时忽略 */ }
+      if (deletingTaskIdsRef.current.has(entry.taskId)) return;
       const run = entry.url ? hfDownloadUrl(entry.url, entry.taskId) : hfDownload(entry.repo, entry.file, entry.taskId);
-      void run.then((result) => {
+      return run.then(async (result) => {
+        if (deletingTaskIdsRef.current.has(entry.taskId) || cancelledTaskIdsRef.current.has(entry.taskId)) return result.path;
         appendLog(t("explore.downloaded") + ": " + result.path, "system");
-        void importDownloadedModel(entry, result.path, result.sizeBytes);
-      }).catch((error) => {
+        await importDownloadedModel(entry, result.path, result.sizeBytes);
+        return result.path;
+      }).catch((error): undefined => {
+        if (deletingTaskIdsRef.current.has(entry.taskId)) return;
         const isCancelled = cancelledTaskIdsRef.current.has(entry.taskId);
         cancelledTaskIdsRef.current.delete(entry.taskId);
         const raw = error instanceof Error ? error.message : String(error);
@@ -569,6 +580,10 @@ export default function App() {
         patchByTaskId(entry.taskId, failed);
       });
     })();
+    downloadRunsRef.current.set(entry.taskId, pendingRun);
+    void pendingRun.finally(() => {
+      if (downloadRunsRef.current.get(entry.taskId) === pendingRun) downloadRunsRef.current.delete(entry.taskId);
+    });
   };
 
   // 启动后自动续传：恢复的任务中以 active 开场（上次退出时未完成）→ 重新发起下载（后端 .part 断点续传）
@@ -617,6 +632,7 @@ export default function App() {
       mutateDownloads((previous) => previous.map((item) => (item.taskId === taskId ? { ...item, ...patch } : item)));
     };
     void onModelDownloadProgress((payload) => {
+      if (deletingTaskIdsRef.current.has(payload.taskId)) return;
       // 展示用进度表仍按 仓库::文件名 索引（FileModal / 模型仓库下载占位共用），任务状态则按 taskId 精确命中
       const key = payload.repo + "::" + payload.file;
       if (payload.phase === "done") {
@@ -661,6 +677,7 @@ export default function App() {
   }, []);
 
   const persist = async (next: AppConfig, message?: string) => {
+    configRef.current = next;
     setConfig(next);
     /** 语言随本次保存立即生效（值未变时为空操作） */
     setLocale(next.language ?? "zh");
@@ -689,7 +706,7 @@ export default function App() {
   const getTaskFilePath = (task: ActiveDownload): string => {
     if (task.path) return task.path;
     if (!diskUsage?.path) return "";
-    const root = diskUsage.path.replace(/[\\/]+$/, "");
+    const root = diskUsage.path.replace(getPlatform() === "windows" ? /[\\/]+$/ : /\/+$/, "");
     if (task.repo === "direct-url") {
       return root + "/" + task.file;
     }
@@ -699,17 +716,19 @@ export default function App() {
   };
 
   /** 清理某任务在本地的缓存文件：目标文件 + .part 断点文件（已入库的完成任务由调用方跳过） */
-  const removeTaskFiles = (task: ActiveDownload) => {
-    const file = getTaskFilePath(task);
-    if (file) {
-      void removeLocalFile(file).catch(() => undefined);
-      void removeLocalFile(file + ".part").catch(() => undefined);
+  const removeTaskFiles = async (task: ActiveDownload) => {
+    const result = await removeDownloadFiles(getTaskFilePath(task));
+    if (result.errors.length) {
+      const message = t("explore.error", { error: result.errors.join("\n") });
+      appendLog(message, "stderr");
+      setToast(message);
     }
   };
 
   /** 下载完成：仅把主模型登记为本地资产（mmproj 图识模型仅保存文件供预设挂载，不自动入库），badge 打上「刚刚下载」 */
   const importDownloadedModel = async (download: ActiveDownload, path: string, sizeBytes?: number) => {
     try {
+      if (deletingTaskIdsRef.current.has(download.taskId) || cancelledTaskIdsRef.current.has(download.taskId)) return;
       const fileBaseName = fileName(path);
       // 图识视觉模型（mmproj）是辅助模型，需通过启动参数 --mmproj 挂载在主模型预设下，不作为独立模型入库
       if (fileBaseName.toLowerCase().includes("mmproj")) {
@@ -718,17 +737,17 @@ export default function App() {
         return;
       }
 
-      // 下载耗时数分钟，期间用户可能改过设置：读最新 config 而非发起下载时的闭包快照，
-      // 否则 persist 会把用户中途修改的主题 / 语言 / 代理等一并回滚
-      const currentConfig = configRef.current;
-      const existing = new Set(currentConfig.models.map((model) => model.path.toLowerCase()));
-      if (existing.has(path.toLowerCase())) {
-        patchByTaskId(download.taskId, { status: "done" as const, path, finishedAt: Date.now() });
-        return;
-      }
       const name = fileBaseName.replace(/\.(gguf|ninfer)$/i, "").replace(/[-_]/g, " ");
       const isNinfer = path.toLowerCase().endsWith(".ninfer");
       const meta = await inspectGguf(path).catch(() => ({ architecture: "", parameters: "", quantization: "" }));
+      if (deletingTaskIdsRef.current.has(download.taskId) || cancelledTaskIdsRef.current.has(download.taskId)) return;
+      // 元数据读取后再检查路径与配置，避免异步期间的修改被旧快照覆盖。
+      const currentConfig = configRef.current;
+      const existing = new Set(currentConfig.models.map((model) => pathIdentity(model.path)));
+      if (existing.has(pathIdentity(path))) {
+        patchByTaskId(download.taskId, { status: "done" as const, path, finishedAt: Date.now() });
+        return;
+      }
       const paramMatch = path.match(/\d+(?:\.\d+)?B/i)?.[0]?.toUpperCase();
       const parameters = meta.parameters || paramMatch || "—";
       const initialProfiles = defaultProfilesForModel(path);
@@ -767,6 +786,7 @@ export default function App() {
 
   /** 重新发起某任务的下载（失败 / 暂停任务恢复与单任务重试共用），按原 taskId 重打后端控制器 */
   const relaunchTask = (task: ActiveDownload) => {
+    if (deletingTaskIdsRef.current.has(task.taskId)) return;
     const entry: ActiveDownload = { ...task, startedAt: Date.now(), status: "active" as const, percent: 0, downloaded: 0, total: task.total ?? task.sizeBytes, speedBps: 0 };
     patchByTaskId(task.taskId, entry);
     launchDownload(entry);
@@ -788,7 +808,7 @@ export default function App() {
       (targetTask.taskId ? item.taskId !== targetTask.taskId : !(item.repo === targetTask.repo && item.file === targetTask.file))
     ));
 
-    if (withDelete) removeTaskFiles(targetTask);
+    if (withDelete) void removeTaskFiles(targetTask);
     clearProgressKey(targetTask.repo, targetTask.file);
     setToast(t("toast.downloadCancelled"));
   };
@@ -824,38 +844,54 @@ export default function App() {
    *  若 deleteLocalFiles = true，还会彻底删除本地硬盘文件，并同步从模型仓库 config.models 中移除并持久化。 */
   const deleteTasksImpl = async (ids: string[], deleteLocalFiles = false) => {
     const idSet = new Set(ids);
-    const targets = downloadsRef.current.filter((item) => idSet.has(item.taskId));
+    const targets = downloadsRef.current.filter((item) => idSet.has(item.taskId) && !deletingTaskIdsRef.current.has(item.taskId));
     if (!targets.length) return;
-    // 先按 taskId 中止仍在下载的任务，再清缓存、移记录
+    const removedIds = new Set<string>();
+    const removedPaths = new Set<string>();
+    const errors: string[] = [];
+    // 先阻止迟到的下载事件/入库，再等待该任务下载循环结束；失败项保留供重试。
     for (const task of targets) {
-      cancelledTaskIdsRef.current.add(task.taskId);
+      deletingTaskIdsRef.current.add(task.taskId);
       cancelPendingProgress(task.taskId);
       clearProgressKey(task.repo, task.file);
-      if (task.status === "active") void hfCancelDownload(task.taskId).catch(() => undefined);
     }
-    mutateDownloads((previous) => previous.filter((item) => !idSet.has(item.taskId)));
-
-    if (deleteLocalFiles) {
-      const removedPaths = new Set<string>();
-      for (const task of targets) {
-        if (task.path) {
-          removedPaths.add(task.path.toLowerCase());
-          void removeLocalFile(task.path).catch(() => undefined);
+    await Promise.all(targets.map(async (task) => {
+      let file = getTaskFilePath(task);
+      try {
+        const run = downloadRunsRef.current.get(task.taskId);
+        if (task.status === "active" || run) await hfCancelDownload(task.taskId);
+        const completedPath = run ? await run : undefined;
+        file = completedPath || file;
+        const inLibrary = configRef.current.models.some((model) => pathIdentity(model.path) === pathIdentity(file));
+        if (deleteLocalFiles || !(inLibrary || (task.status === "done" && task.path))) {
+          const result = await removeDownloadFiles(file);
+          if (deleteLocalFiles) for (const path of result.removedPaths) removedPaths.add(path);
+          if (result.errors.length) throw new Error(result.errors.join("\n"));
         }
-        removeTaskFiles(task);
+        removedIds.add(task.taskId);
+      } catch (error) {
+        const message = `${task.file}: ${String(error)}`;
+        errors.push(message);
+        patchByTaskId(task.taskId, { status: "error", error: message, path: file || task.path, speedBps: 0 });
+      } finally {
+        deletingTaskIdsRef.current.delete(task.taskId);
       }
-      const nextModels = config.models.filter((model) => !removedPaths.has(model.path.toLowerCase()));
-      if (nextModels.length !== config.models.length) {
-        await persist({ ...config, models: nextModels });
+    }));
+    mutateDownloads((previous) => previous.filter((item) => !removedIds.has(item.taskId)));
+    if (removedPaths.size) {
+      const currentConfig = configRef.current;
+      const nextModels = removeModelsAtPaths(currentConfig.models, removedPaths);
+      if (nextModels.length !== currentConfig.models.length) {
+        await persist({ ...currentConfig, models: nextModels });
       }
-      void getModelsDir().then(setDiskUsage).catch(() => undefined);
-      setToast(t("toast.tasksAndFilesDeleted", { count: targets.length }));
+    }
+    if (deleteLocalFiles) void getModelsDir().then(setDiskUsage).catch(() => undefined);
+    if (errors.length) {
+      const message = t("explore.error", { error: errors.join("\n") });
+      appendLog(message, "stderr");
+      setToast(message);
     } else {
-      for (const task of targets) {
-        if (task.status === "done" && task.path) continue; // 已同步进模型仓库，不删库内文件
-        removeTaskFiles(task);
-      }
-      setToast(t("toast.tasksDeleted", { count: targets.length }));
+      setToast(t(deleteLocalFiles ? "toast.tasksAndFilesDeleted" : "toast.tasksDeleted", { count: removedIds.size }));
     }
   };
   /** 单任务删除 */
@@ -1026,8 +1062,13 @@ export default function App() {
 
   const addModelFromPaths = async (paths: { path: string; sizeBytes: number }[]) => {
     if (!paths.length) return;
-    const existing = new Set(config.models.map((model) => model.path));
-    const fresh = paths.filter((item) => !existing.has(item.path));
+    const existing = new Set(configRef.current.models.map((model) => pathIdentity(model.path)));
+    const fresh = paths.filter((item) => {
+      const key = pathIdentity(item.path);
+      if (!item.path || existing.has(key)) return false;
+      existing.add(key);
+      return true;
+    });
     if (!fresh.length) return setToast(t("toast.alreadyInLibrary"));
     const additions: ModelAsset[] = [];
     for (const [index, item] of fresh.entries()) {
@@ -1048,8 +1089,12 @@ export default function App() {
         accent: ACCENTS[(config.models.length + index) % ACCENTS.length]
       });
     }
-    setSelectedProfiles((previous) => { const next = { ...previous }; for (const model of additions) next[model.id] = model.profiles[0].id; return next; });
-    await persist({ ...config, models: [...config.models, ...additions] }, t(additions.length === 1 ? "toast.modelAdded" : "toast.modelsAdded", { count: additions.length }));
+    const currentConfig = configRef.current;
+    const known = new Set(currentConfig.models.map((model) => pathIdentity(model.path)));
+    const accepted = additions.filter((model) => !known.has(pathIdentity(model.path)));
+    if (!accepted.length) return setToast(t("toast.alreadyInLibrary"));
+    setSelectedProfiles((previous) => { const next = { ...previous }; for (const model of accepted) next[model.id] = model.profiles[0].id; return next; });
+    await persist({ ...currentConfig, models: [...currentConfig.models, ...accepted] }, t(accepted.length === 1 ? "toast.modelAdded" : "toast.modelsAdded", { count: accepted.length }));
   };
   /** 统一入口：打开导入弹窗（拖拽 / 选文件 / 选文件夹都在弹窗内完成） */
   const openImport = () => setImportOpen(true);
@@ -1175,9 +1220,9 @@ export default function App() {
       if (!incoming) return;
       const migrated = migrateConfig(incoming);
       const candidates = [...(migrated.models || []).map((model) => model.path), ...(migrated.engines || []).map((engine) => engine.path)].filter(Boolean);
-      const present = new Set((await pathsExist(candidates)).map((path) => path.toLowerCase()));
-      const missing = new Set(candidates.map((path) => path.toLowerCase()).filter((path) => !present.has(path)));
-      const merged = mergeImportedConfig(config, migrated, missing);
+      const present = new Set((await pathsExist(candidates)).map((path) => pathIdentity(path)));
+      const missing = new Set(candidates.filter((path) => !present.has(pathIdentity(path))));
+      const merged = mergeImportedConfig(configRef.current, migrated, missing);
       await persist(merged.config, t("toast.backupImported", { added: merged.added, updated: merged.updated, skipped: merged.skipped }));
     } catch (error) {
       setToast(t("toast.backupFailed", { error: String(error) }));
@@ -1280,7 +1325,7 @@ export default function App() {
       )}
     </div>
     {profileEditing && <ProfileEditor engines={config.engines} activeEngineId={config.activeEngineId} model={config.models.find((m) => m.id === profileEditing.modelId)} profile={profileEditing.profile} defaultProfileId={config.models.find((m) => m.id === profileEditing.modelId)?.defaultProfileId} onClose={() => setProfileEditing(null)} onSave={(profile, isDefault) => saveProfile(profileEditing.modelId, profile, isDefault)} />}
-    {importOpen && <ImportModelModal existingPaths={new Set(config.models.map((model) => model.path.toLowerCase()))} onClose={() => setImportOpen(false)} onImport={handleImportModels} />}
+    {importOpen && <ImportModelModal existingPaths={new Set(config.models.map((model) => pathIdentity(model.path)))} onClose={() => setImportOpen(false)} onImport={handleImportModels} />}
     <EngineHubModal
       open={engineHubOpen}
       onClose={() => setEngineHubOpen(false)}

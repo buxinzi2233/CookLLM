@@ -16,6 +16,7 @@ import type { LlamaEngine } from "../types";
 import { useI18n } from "../i18n";
 import { cn, formatEngineBackend, detectEngineType, getEngineTypeDisplay, type EngineTypeKey } from "../utils";
 import { getLlamaCppStatus, pickServerFile, revealInFolder, type LlamaCppLocalStatus } from "../tauri";
+import { defaultEngineBackend, engineInputPath, enginePathPlaceholder, canAutoInstallEngine } from "../platform";
 import ConfirmModal from "./ConfirmModal";
 
 interface EngineHubModalProps {
@@ -47,7 +48,7 @@ export default function EngineHubModal({
   // 详情编辑表单状态
   const [draftName, setDraftName] = useState("");
   const [draftPath, setDraftPath] = useState("");
-  const [draftBackend, setDraftBackend] = useState("cuda");
+  const [draftBackend, setDraftBackend] = useState<string>(defaultEngineBackend());
   const [probing, setProbing] = useState(false);
   const [probeStatus, setProbeStatus] = useState<LlamaCppLocalStatus | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
@@ -102,7 +103,7 @@ export default function EngineHubModal({
     if (selectedEngine) {
       setDraftName(selectedEngine.name);
       setDraftPath(selectedEngine.path);
-      setDraftBackend(selectedEngine.backend || "cuda");
+      setDraftBackend(selectedEngine.backend || defaultEngineBackend());
       setSaveSuccess(false);
 
       if (selectedEngine.path) {
@@ -132,18 +133,18 @@ export default function EngineHubModal({
   const isModified = Boolean(
     selectedEngine &&
       (draftName.trim() !== selectedEngine.name ||
-        draftPath.trim() !== selectedEngine.path ||
-        draftBackend !== (selectedEngine.backend || "cuda")),
+        engineInputPath(draftPath) !== selectedEngine.path ||
+        draftBackend !== (selectedEngine.backend || defaultEngineBackend())),
   );
 
   // 保存修改（引擎架构类型自动识别填充）
   const handleSave = () => {
-    if (!selectedEngine || !draftPath.trim()) return;
-    const inferredType = (probeStatus?.engineType as EngineTypeKey) || detectEngineType(draftPath.trim());
+    if (!selectedEngine || !engineInputPath(draftPath)) return;
+    const inferredType = (probeStatus?.engineType as EngineTypeKey) || detectEngineType(engineInputPath(draftPath));
     const updated: LlamaEngine = {
       ...selectedEngine,
       name: draftName.trim() || selectedEngine.name,
-      path: draftPath.trim(),
+      path: engineInputPath(draftPath),
       backend: draftBackend,
       cudaVersion: draftBackend === "cuda" ? (probeStatus?.cudaVersion || selectedEngine.cudaVersion) : undefined,
       version: probeStatus?.localVersion || selectedEngine.version,
@@ -246,7 +247,7 @@ export default function EngineHubModal({
                       <span
                         className={cn(
                           "engine-hub-tag backend",
-                          (item.backend || "cuda").toLowerCase(),
+                          (item.backend || defaultEngineBackend()).toLowerCase(),
                         )}
                       >
                         {formatEngineBackend(
@@ -358,7 +359,7 @@ export default function EngineHubModal({
                     className="engine-hub-input monospace"
                     value={draftPath}
                     onChange={(e) => setDraftPath(e.target.value)}
-                    placeholder="C:\llama.cpp\llama-server.exe"
+                    placeholder={enginePathPlaceholder()}
                   />
                 </div>
 
@@ -416,7 +417,7 @@ export default function EngineHubModal({
                   <button
                     type="button"
                     className="secondary-button compact engine-hub-save-btn"
-                    disabled={!isModified || !draftPath.trim()}
+                    disabled={!isModified || !engineInputPath(draftPath)}
                     onClick={handleSave}
                   >
                     <Save size={13} />
@@ -436,7 +437,7 @@ export default function EngineHubModal({
         <footer className="engine-hub-footer">
           <div className="engine-hub-footer-hint">
             <Sparkles size={13} />
-            <span>{t("llama.presetEngineHint")}</span>
+            <span>{t(canAutoInstallEngine() ? "llama.presetEngineHint" : "linux.manualEngine")}</span>
           </div>
           <button type="button" className="secondary-button compact" onClick={onClose}>
             {t("close")} (ESC)

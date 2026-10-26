@@ -1,5 +1,6 @@
 import type { AppConfig, LlamaLogPayload, ModelAsset, Profile } from "./types";
 import { formatMessage, getLocale } from "./i18n";
+import { getPlatform, pathIdentity, type Platform } from "./platform";
 
 /** 当前应用版本（与 tauri.conf.json / package.json 保持一致）：浏览器模式回退值，检测更新的比较基线 */
 export const APP_VERSION = "0.3.2";
@@ -9,38 +10,51 @@ export const PROJECT_URL = `https://github.com/${APP_REPO}`;
 
 export const uid = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
+/** 真实桌面初始化使用空配置；演示模型与 Windows 示例路径只用于浏览器预览。 */
+export const EMPTY_CONFIG: AppConfig = { serverPath: "", engines: [], models: [] };
+
 /** 合并导入的配置：同路径模型保留本机条目并补齐缺失预设；调用方传入本机不存在的路径集合。 */
-export function mergeImportedConfig(current: AppConfig, incoming: AppConfig, missingPaths: Set<string> = new Set()): { config: AppConfig; added: number; updated: number; skipped: number } {
-  const missing = (path?: string) => missingPaths.has((path || "").toLowerCase());
-  const byPath = new Map(current.models.map((model) => [model.path.toLowerCase(), model]));
+export function mergeImportedConfig(current: AppConfig, incoming: AppConfig, missingPaths: Set<string> = new Set(), platform: Platform = getPlatform()): { config: AppConfig; added: number; updated: number; skipped: number } {
+  const key = (path: string) => pathIdentity(path, platform);
+  const missingKeys = new Set([...missingPaths].map(key));
+  const missing = (path?: string) => !path || missingKeys.has(key(path));
+  const byPath = new Map(current.models.map((model) => [key(model.path), model]));
   let added = 0;
   let updated = 0;
   let skipped = 0;
   const models = [...current.models];
   for (const raw of incoming.models || []) {
-    const path = raw.path?.trim();
-    if (!path || missing(path)) { skipped += 1; continue; }
-    const existing = byPath.get(path.toLowerCase());
+    const path = raw.path;
+    if (missing(path)) { skipped += 1; continue; }
+    const existing = byPath.get(key(path));
     if (!existing) {
       models.push(raw);
+      byPath.set(key(path), raw);
       added += 1;
       continue;
     }
     const known = new Set(existing.profiles.map((profile) => profile.id));
     const profiles = [...existing.profiles];
     for (const profile of raw.profiles || []) {
-      if (!known.has(profile.id)) profiles.push(profile);
+      if (!known.has(profile.id)) {
+        profiles.push(profile);
+        known.add(profile.id);
+      }
     }
-    const index = models.findIndex((model) => model.id === existing.id);
+    const index = models.indexOf(existing);
     if (index >= 0 && profiles.length !== existing.profiles.length) {
       models[index] = { ...existing, profiles, tags: existing.tags?.length ? existing.tags : raw.tags };
+      byPath.set(key(path), models[index]);
       updated += 1;
     }
   }
   const engines = [...(current.engines || [])];
   const engineIds = new Set(engines.map((engine) => engine.id));
   for (const engine of incoming.engines || []) {
-    if (engine.path?.trim() && !missing(engine.path) && !engineIds.has(engine.id)) engines.push(engine);
+    if (!missing(engine.path) && !engineIds.has(engine.id)) {
+      engines.push(engine);
+      engineIds.add(engine.id);
+    }
   }
   return {
     config: {
@@ -48,13 +62,19 @@ export function mergeImportedConfig(current: AppConfig, incoming: AppConfig, mis
       models,
       engines,
       customTags: Array.from(new Set([...(current.customTags || []), ...(incoming.customTags || [])])),
-      serverPath: current.serverPath || incoming.serverPath,
-      activeEngineId: current.activeEngineId || incoming.activeEngineId,
+      serverPath: current.serverPath || (!missing(incoming.serverPath) ? incoming.serverPath : ""),
+      activeEngineId: current.activeEngineId || (engines.some((engine) => engine.id === incoming.activeEngineId) ? incoming.activeEngineId : undefined),
     },
     added,
     updated,
     skipped,
   };
+}
+
+/** 仅由已成功删除（或后端确认已不存在）的文件路径移除模型记录。 */
+export function removeModelsAtPaths(models: ModelAsset[], removedPaths: Iterable<string>, platform: Platform = getPlatform()): ModelAsset[] {
+  const removed = new Set([...removedPaths].map((path) => pathIdentity(path, platform)));
+  return models.filter((model) => !removed.has(pathIdentity(model.path, platform)));
 }
 export const DEFAULT_PROFILES: Profile[] = [
   { id: "balanced", name: "均衡模式", description: "日常对话与编码的推荐配置", host: "0.0.0.0", port: 9931, gpuLayers: 35, contextSize: 8192, threads: 8, parallel: 1, batchSize: 512, ubatchSize: 256, flashAttention: true, ncmoeLayers: 0, mtp: false, mtpDraftPath: undefined, specDraftNMax: 3, cacheTypeK: "f32", cacheTypeV: "f32", jinja: true, reasoning: "auto", reasoningEffort: "auto", reasoningBudget: -1, noMmprojOffload: false, loadMode: "mmap", temperature: 0.7, topP: 0.9, minP: 0.05, repeatPenalty: 1.1, extraArgs: "" },
@@ -183,7 +203,7 @@ export function migrateConfig(config: AppConfig): AppConfig {
   // 引擎多分支迁移：若 engines 为空且 serverPath 存在，自动初始化一个默认分支并同步
   let engines = config.engines ? [...config.engines] : [];
   let activeEngineId = config.activeEngineId;
-  const currentPath = (config.serverPath || "").trim();
+  const currentPath = config.serverPath || "";
 
   if (engines.length === 0 && currentPath) {
     const defaultId = uid("engine");

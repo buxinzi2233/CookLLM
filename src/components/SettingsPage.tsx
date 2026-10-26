@@ -3,8 +3,9 @@ import { useEffect, useRef, useState } from "react";
 import { APP_REPO, PROJECT_URL } from "../data";
 import { useI18n } from "../i18n";
 import { cn, formatBytes, formatMB, formatEngineBackend } from "../utils";
-import { cancelLlamaCppUpdate, checkLlamaCppUpdate, checkOrphanServer, detectHardware, downloadLlamaCpp, getAppVersion, getGpuInfo, getLlamaCppStatus, getModelsDir, getSystemProxy, hfWhoami, onDownloadProgress, openConfigDir, openExternal, pickModelsDir, pickServerDir, pickServerFile, revealInFolder, testProxyConnection, type DownloadProgress, type GpuInfo, type HardwareSuggestion, type LlamaCppLocalStatus, type LlamaCppRelease, type OrphanProcessItem, type ProxyTestResult, type ServerCandidate, type UpdateCheckResult } from "../tauri";
+import { engineDownloadInfo, engineReleaseUpToDate, cancelLlamaCppUpdate, checkLlamaCppUpdate, checkOrphanServer, detectHardware, downloadLlamaCpp, getAppVersion, getGpuInfo, getLlamaCppStatus, getModelsDir, loadConfig, getSystemProxy, hfWhoami, onDownloadProgress, openConfigDir, openExternal, pickModelsDir, pickServerDir, pickServerFile, revealInFolder, testProxyConnection, type DownloadProgress, type GpuInfo, type HardwareSuggestion, type LlamaCppLocalStatus, type LlamaCppRelease, type OrphanProcessItem, type ProxyTestResult, type ServerCandidate, type UpdateCheckResult } from "../tauri";
 import type { AppConfig, DiskUsage, LlamaEngine, LlamaLogPayload } from "../types";
+import { acceptsDownloadProgress, canAutoInstallApp, canAutoInstallEngine, autoEngineBackend, defaultEngineBackend, engineInputPath, getPlatform, minimizeToTrayOnClose, pathIdentity } from "../platform";
 import ConfirmModal from "./ConfirmModal";
 import EngineModal from "./EngineModal";
 
@@ -38,15 +39,15 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
   const engines: LlamaEngine[] = config.engines && config.engines.length > 0
     ? config.engines
     : config.serverPath
-      ? [{ id: "engine-default", name: "默认引擎", path: config.serverPath, backend: "cuda" }]
+      ? [{ id: "engine-default", name: "默认引擎", path: config.serverPath, backend: defaultEngineBackend() }]
       : [];
 
   const activeEngine = engines.find((e) => e.id === config.activeEngineId)
-    || engines.find((e) => e.path.toLowerCase() === serverPath.toLowerCase())
+    || engines.find((e) => pathIdentity(e.path) === pathIdentity(serverPath))
     || engines[0];
 
   const handleSaveEngine = async (engine: LlamaEngine, setAsActive: boolean) => {
-    let nextEngines = config.engines && config.engines.length > 0 ? [...config.engines] : (config.serverPath ? [{ id: "engine-default", name: "默认引擎", path: config.serverPath, backend: "cuda" }] : []);
+    let nextEngines = config.engines && config.engines.length > 0 ? [...config.engines] : (config.serverPath ? [{ id: "engine-default", name: "默认引擎", path: config.serverPath, backend: defaultEngineBackend() }] : []);
     const existingIndex = nextEngines.findIndex((e) => e.id === engine.id);
     if (existingIndex >= 0) {
       nextEngines[existingIndex] = engine;
@@ -101,10 +102,10 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
   };
 
   const gpuOn = config.gpuMonitorEnabled !== false;
-  const trayOn = config.minimizeToTrayOnClose !== false;
+  const trayOn = minimizeToTrayOnClose(config.minimizeToTrayOnClose);
   const saveServerPath = (value: string) => {
     setServerPath(value);
-    if (value.trim() && value !== config.serverPath) void onPersist({ ...config, serverPath: value.trim() }, t("toast.settingsSaved"));
+    if (engineInputPath(value) && pathIdentity(engineInputPath(value)) !== pathIdentity(config.serverPath)) void onPersist({ ...config, serverPath: engineInputPath(value) }, t("toast.settingsSaved"));
   };
 
   const chooseModelsDir = async () => {
@@ -226,8 +227,10 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
   const [engineStatus, setEngineStatus] = useState<LlamaCppLocalStatus | null>(null);
   const [remote, setRemote] = useState<LlamaCppRelease | null>(null);
   const [checking, setChecking] = useState(false);
-  const [backend, setBackend] = useState<"cuda" | "vulkan" | "cpu">(config.llamaBackend || "cuda");
-  const [cudaVersion, setCudaVersion] = useState(config.llamaCudaVersion || "12");
+  const [backend, setBackend] = useState<"cuda" | "vulkan" | "cpu">(autoEngineBackend(config.llamaBackend));
+  const [cudaVersion, setCudaVersion] = useState(config.llamaCudaVersion || (getPlatform() === "linux" ? "auto" : "12"));
+  const engineSelection = useRef({ backend, cudaVersion, generation: 0, userSelected: false, initialized: false });
+  const engineOperation = useRef({ id: 0, active: false, mounted: true });
   const [cudaMenuOpen, setCudaMenuOpen] = useState(false);
   const cudaMenuRef = useRef<HTMLDivElement>(null);
   const [updating, setUpdating] = useState(false);
@@ -237,9 +240,23 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
   const checkResultTimer = useRef<number | null>(null);
 
   useEffect(() => {
-    if (config.llamaBackend) setBackend(config.llamaBackend);
-    if (config.llamaCudaVersion) setCudaVersion(config.llamaCudaVersion);
+    // A persisted snapshot or delayed refresh must not reset an immediate UI choice.
+    if (engineSelection.current.userSelected || engineOperation.current.active) return;
+    const nextBackend = autoEngineBackend(config.llamaBackend);
+    const nextCuda = config.llamaCudaVersion || (getPlatform() === "linux" ? "auto" : "12");
+    if (nextBackend === engineSelection.current.backend && nextCuda === engineSelection.current.cudaVersion) return;
+    Object.assign(engineSelection.current, { backend: nextBackend, cudaVersion: nextCuda });
+    setBackend(nextBackend); setCudaVersion(nextCuda);
+    void ensureRemote(nextBackend, nextCuda, true);
   }, [config.llamaBackend, config.llamaCudaVersion]);
+
+  const selectEngine = (nextBackend: "cuda" | "vulkan" | "cpu", nextCuda = engineSelection.current.cudaVersion) => {
+    if (engineOperation.current.active) return;
+    Object.assign(engineSelection.current, { backend: nextBackend, cudaVersion: nextCuda, userSelected: true });
+    setBackend(nextBackend); setCudaVersion(nextCuda); setRemote(null); setCheckResult(null);
+    void onPersist({ ...config, llamaBackend: nextBackend, llamaCudaVersion: nextCuda }, "");
+    void ensureRemote(nextBackend, nextCuda);
+  };
 
   useEffect(() => {
     if (!cudaMenuOpen) return;
@@ -272,6 +289,7 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
         getLlamaCppStatus(),
         checkOrphanServer().catch(() => null),
       ]);
+      if (!engineOperation.current.mounted) return;
       setHardware(hw);
       setEngineStatus(st);
       if (orphan && orphan.processes && orphan.processes.length > 0) {
@@ -279,19 +297,15 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
       } else {
         setDetectedServer(null);
       }
-      if (config.llamaBackend) {
-        setBackend(config.llamaBackend);
-      } else if (hw) {
-        setBackend(hw.recommendedBackend);
-      } else if (st?.localBackend) {
-        setBackend(st.localBackend);
-      }
-
-      if (config.llamaCudaVersion) {
-        setCudaVersion(config.llamaCudaVersion);
-      } else if (st?.cudaVersion) {
-        const major = st.cudaVersion.split(".")[0];
-        if (major) setCudaVersion(major);
+      if (!engineSelection.current.initialized && !engineSelection.current.userSelected && !engineOperation.current.active) {
+        engineSelection.current.initialized = true;
+        const preferred = config.llamaBackend ?? hw?.recommendedBackend ?? st?.localBackend;
+        const nextBackend = canAutoInstallEngine(getPlatform(), preferred) ? autoEngineBackend(preferred) : defaultEngineBackend();
+        const nextCuda = config.llamaCudaVersion || (getPlatform() === "linux" ? "auto" : st?.cudaVersion?.split(".")[0] || "12");
+        const changed = nextBackend !== engineSelection.current.backend || nextCuda !== engineSelection.current.cudaVersion;
+        Object.assign(engineSelection.current, { backend: nextBackend, cudaVersion: nextCuda });
+        setBackend(nextBackend); setCudaVersion(nextCuda);
+        if (changed) void ensureRemote(nextBackend, nextCuda, true);
       }
     } catch { /* 非 Tauri 环境忽略 */ }
   };
@@ -306,24 +320,37 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
     overrideCuda?: string,
     silent = false
   ): Promise<LlamaCppRelease | null> => {
-    const useBackend = overrideBackend ?? backend;
-    const useCuda = overrideCuda ?? cudaVersion;
+    const useBackend = overrideBackend ?? engineSelection.current.backend;
+    const useCuda = overrideCuda ?? engineSelection.current.cudaVersion;
+    const generation = ++engineSelection.current.generation;
+    const isCurrent = () => engineOperation.current.mounted && generation === engineSelection.current.generation;
+    setRemote(null); setCheckResult(null);
+    if (!canAutoInstallEngine(getPlatform(), useBackend)) {
+      setRemote(null);
+      if (!silent) setEngineError(t("linux.engineGate"));
+      return null;
+    }
     setChecking(true);
-    if (!silent) setEngineError(null);
+    setEngineError(null);
     try {
       const result = await checkLlamaCppUpdate(useBackend, useCuda);
-      const local = engineStatus?.localVersion ?? "";
-      const isSameBackend = engineStatus?.localBackend ? engineStatus.localBackend === useBackend : true;
-      const upToDate = !!local && isSameBackend && result.tag.toLowerCase().endsWith(local.toLowerCase());
+      if (!isCurrent()) return null;
+      if (getPlatform() === "linux") {
+        if (result.matchAsset?.backend !== useBackend) throw new Error(t("linux.assetMissing"));
+        engineDownloadInfo(result);
+      }
+      const upToDate = engineReleaseUpToDate(result, engineStatus, useBackend);
       const next = { ...result, upToDate };
       setRemote(next);
       return next;
     } catch (error) {
-      if (!silent) setEngineError(error instanceof Error ? error.message : String(error));
-      setRemote(null);
+      if (isCurrent()) {
+        setEngineError(error instanceof Error ? error.message : String(error));
+        setRemote(null);
+      }
       return null;
     } finally {
-      setChecking(false);
+      if (isCurrent()) setChecking(false);
     }
   };
 
@@ -338,128 +365,154 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
   };
 
   const backendLabel = (value: "cuda" | "vulkan" | "cpu") => value.toUpperCase();
-  // 从远程资产提取可用的 CUDA 主版本（去重、降序；远程尚未拉取时提供常用版本候选）
-  const discoveredCuda = Array.from(
-    new Set(
-      (remote?.assets ?? [])
-        .filter((asset) => asset.backend === "cuda" && asset.cudaVersion)
-        .map((asset) => asset.cudaVersion as string)
-    )
-  ).sort((a, b) => Number(b) - Number(a));
+  // Linux exposes exact metadata versions and keeps legacy major-version requests valid.
+  const discoveredCuda = Array.from(new Set((remote?.assets ?? [])
+    .filter(asset => asset.backend === "cuda")
+    .map(asset => (getPlatform() === "linux" ? asset.cudaFullVersion : asset.cudaVersion) || asset.cudaVersion || "")
+    .filter(Boolean))).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+  const cudaOptions = Array.from(new Set(["auto", ...discoveredCuda, "12", "13", ...(getPlatform() === "linux" ? [] : ["11"]), cudaVersion]));
+  const cudaSelectOptions = cudaOptions.map(ver => ({ value: ver, label: ver === "auto" ? t("llama.cudaAuto") : `CUDA ${ver}`, full: ver }));
 
-  const cudaOptions = discoveredCuda.length > 0 ? discoveredCuda : ["13", "12", "11"];
-
-  const cudaSelectOptions = cudaOptions.map((ver) => {
-    const asset = remote?.assets?.find((a) => a.backend === "cuda" && a.cudaVersion === ver);
-    const full = asset?.cudaFullVersion || (ver === "12" ? "12.4" : ver === "11" ? "11.8" : ver === "13" ? "13.4" : ver);
-    const label = full && full !== ver ? `CUDA ${ver} (${full})` : `CUDA ${ver}`;
-    return { value: ver, label, full };
-  });
-
-  const getCudaDisplayShort = () => {
-    if (cudaVersion && cudaVersion !== "auto") {
-      const opt = cudaSelectOptions.find((o) => o.value === cudaVersion);
-      if (opt?.full) return opt.full;
-      if (cudaVersion === "12") return "12.4";
-      if (cudaVersion === "11") return "11.8";
-      if (cudaVersion === "13") return "13.4";
-      return cudaVersion;
-    }
-    if (engineStatus?.cudaVersion) return engineStatus.cudaVersion;
-    if (activeEngine?.cudaVersion) return activeEngine.cudaVersion;
-    return cudaSelectOptions[0]?.full || "12.4";
-  };
+  const getCudaDisplayShort = () => cudaVersion === "auto"
+    ? remote?.matchAsset?.cudaFullVersion || t("llama.cudaAuto")
+    : cudaVersion;
 
   // 强制重装：忽略版本比较，直接重新下载安装（用于修复损坏文件）
   const forceReinstall = async () => {
+    if (!canAutoInstallEngine(getPlatform(), backend)) { setEngineError(t("linux.engineGate")); return; }
     if (updating) return;
-    if (!remote && !(await ensureRemote())) return;
-    await runUpdate(backend);
+    await runUpdate(backend, true);
   };
 
-  // 点击“一键更新”后先弹确认窗（自动识别硬件并推荐后端）
+  // 取消当前下载，不改变手动引擎选择
   const cancelUpdate = () => { void cancelLlamaCppUpdate().catch(() => undefined); };
 
-  const runUpdate = async (useBackend: "cuda" | "vulkan" | "cpu") => {
-    if (updating) return;
-    setUpdating(true); setEngineError(null); setProgress({ phase: "download", percent: 0, downloaded: 0, total: 0, speedBps: 0, message: "" });
+  const runUpdate = async (useBackend: "cuda" | "vulkan" | "cpu", force = false) => {
+    if (!canAutoInstallEngine(getPlatform(), useBackend)) { setEngineError(t("linux.engineGate")); return; }
+    if (updating || engineOperation.current.active) return;
+    const operation = ++engineOperation.current.id;
+    engineOperation.current.active = true;
+    const isActive = () => engineOperation.current.mounted && engineOperation.current.id === operation;
+    setUpdating(true); setEngineError(null);
     let cancelled = false;
     try {
-      const path = await downloadLlamaCpp({ backend: useBackend, cudaVersion, tag: remote?.tag });
-      const parentDir = path.replace(/[/\\][^/\\]+$/, "");
-      const newStatus = await getLlamaCppStatus(parentDir).catch(() => null);
-      const installedCuda = newStatus?.cudaVersion || (useBackend === "cuda" ? getCudaDisplayShort() : undefined);
-      const installedVer = newStatus?.localVersion || remote?.tag;
+      // Always recheck: never download using a cached tag or an asset from a prior selection.
+      const selectedCuda = useBackend === "cuda" ? engineSelection.current.cudaVersion : undefined;
+      const freshRelease = await ensureRemote(useBackend, selectedCuda);
+      if (!freshRelease || (!force && freshRelease.upToDate) || !isActive()) return;
+      const { engine, total } = engineDownloadInfo(freshRelease);
+      const generation = engineSelection.current.generation;
+      setProgress({ phase: "download", percent: 0, downloaded: 0, total, speedBps: 0, message: "" });
+      const path = await downloadLlamaCpp({ backend: useBackend, cudaVersion: selectedCuda,
+        // Windows resolves its own cudart pair only when explicit asset fields are absent.
+        tag: freshRelease.tag, ...(getPlatform() === "linux" ? { assetUrl: engine.url, assetName: engine.fileName } : {}) });
+      if (!isActive()) return;
+      if (getPlatform() === "linux") {
+        // The installer saved directory, backend and engine metadata atomically.
+        // Adopt that entire snapshot, never merge the pre-download config over it.
+        const installed = await loadConfig();
+        if (!isActive()) return;
+        if (!installed) throw new Error(t("linux.configReloadFailed"));
+        await onPersist(installed, "");
+        if (!isActive()) return;
+        setServerPath(installed.serverPath);
+        setBackend(autoEngineBackend(installed.llamaBackend));
+        const installedStatus = await getLlamaCppStatus().catch(() => null);
+        if (!isActive()) return;
+        setEngineStatus(installedStatus);
+      } else {
+        const parentDir = path.replace(/[/\\][^/\\]+$/, "");
+        const newStatus = await getLlamaCppStatus(parentDir).catch(() => null);
+        if (!isActive()) return;
+        const installedCuda = newStatus?.cudaVersion || (useBackend === "cuda" ? getCudaDisplayShort() : undefined);
+        const installedVer = newStatus?.localVersion || freshRelease.tag;
 
-      let nextEngines = config.engines && config.engines.length > 0 ? [...config.engines] : [];
-      if (config.activeEngineId && nextEngines.length > 0) {
-        const idx = nextEngines.findIndex((e) => e.id === config.activeEngineId);
-        if (idx >= 0) {
-          nextEngines[idx] = {
-            ...nextEngines[idx],
+        let nextEngines = config.engines && config.engines.length > 0 ? [...config.engines] : [];
+        if (config.activeEngineId && nextEngines.length > 0) {
+          const idx = nextEngines.findIndex((e) => e.id === config.activeEngineId);
+          if (idx >= 0) {
+            nextEngines[idx] = {
+              ...nextEngines[idx],
+              path,
+              backend: useBackend,
+              cudaVersion: installedCuda,
+              version: installedVer,
+            };
+          }
+        } else if (nextEngines.length > 0) {
+          nextEngines[0] = {
+            ...nextEngines[0],
             path,
             backend: useBackend,
             cudaVersion: installedCuda,
             version: installedVer,
           };
         }
-      } else if (nextEngines.length > 0) {
-        nextEngines[0] = {
-          ...nextEngines[0],
-          path,
-          backend: useBackend,
-          cudaVersion: installedCuda,
-          version: installedVer,
-        };
+        setServerPath(path);
+        await onPersist(
+          {
+            ...config,
+            serverPath: path,
+            llamaBackend: useBackend,
+            llamaCudaVersion: cudaVersion,
+            engines: nextEngines,
+          },
+          ""
+        );
       }
-      setServerPath(path);
-      await onPersist(
-        {
-          ...config,
-          serverPath: path,
-          llamaBackend: useBackend,
-          llamaCudaVersion: cudaVersion,
-          engines: nextEngines,
-        },
-        ""
-      );
+      if (!isActive()) return;
       onLog(t("llama.updated", { path }), "system");
-      await refreshEngine();
+      if (getPlatform() !== "linux") await refreshEngine();
       // 更新已完成：将 remote 标记为已是最新，避免按钮仍显示“立即更新”
-      setRemote((prev) => (prev ? { ...prev, upToDate: true } : prev));
+      if (isActive() && generation === engineSelection.current.generation) {
+        setRemote({ ...freshRelease, upToDate: true });
+      }
     } catch (error) {
+      if (!isActive()) return;
       const raw = error instanceof Error ? error.message : String(error);
-      cancelled = raw.includes("取消");
+      cancelled = raw.includes("取消") || /cancelled|canceled/i.test(raw);
+      setProgress(null);
       setEngineError(cancelled ? t("llama.cancelled") : raw);
       onLog(cancelled ? t("llama.cancelled") : t("llama.failed", { error: raw }), cancelled ? "system" : "stderr");
     } finally {
-      setUpdating(false);
-      window.setTimeout(() => setProgress(null), cancelled ? 400 : 1200);
+      if (isActive()) {
+        engineOperation.current.active = false;
+        setUpdating(false);
+        window.setTimeout(() => { if (isActive() && !engineOperation.current.active) setProgress(null); }, cancelled ? 400 : 1200);
+      }
     }
   };
 
-  // 一键更新：未检查过则先检查；已是最新则直接返回；否则直接开始下载（不再弹确认窗）
+  // 一键更新：重新检查当前选择，已是最新则跳过下载（不再弹确认窗）
   const startUpdate = async () => {
+    if (!canAutoInstallEngine(getPlatform(), backend)) { setEngineError(t("linux.engineGate")); return; }
     if (updating) return;
-    if (!remote) {
-      const next = await ensureRemote();
-      if (!next || next.upToDate) return;
-    } else if (remote.upToDate) return;
     await runUpdate(backend);
   };
   // 订阅下载进度事件（仅 Tauri）
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    void onDownloadProgress((payload) => {
+    let active = true;
+    engineOperation.current.mounted = true;
+    const handleEngineProgress = (payload: DownloadProgress) => {
+      if (!active || !engineOperation.current.active || !acceptsDownloadProgress(payload, "engine")) return;
       setProgress(payload);
       if (payload.phase === "done") {
         onLog(t("llama.progress.done"), "system");
       }
-    }).then((fn) => { unlisten = fn; }).catch(() => undefined);
-    return () => { unlisten?.(); };
+    };
+    void onDownloadProgress(handleEngineProgress).then((fn) => { if (active) unlisten = fn; else fn?.(); }).catch((error) => { if (active) setEngineError(String(error)); });
+    return () => {
+      active = false; unlisten?.();
+      engineOperation.current.mounted = false;
+      engineOperation.current.active = false;
+      engineOperation.current.id++;
+      engineSelection.current.generation++;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const downloadInfo = remote?.matchAsset ? engineDownloadInfo(remote) : null;
   const hasNewVersion = remote !== null && !remote.upToDate;
   const isUpToDate = remote !== null && remote.upToDate === true;
 
@@ -571,7 +624,7 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
             <div className="engine-card-header">
               <div className="engine-card-header-left">
                 <h3>{t("llama.title")}</h3>
-                <p className="about-desc">{t("llama.desc")}</p>
+                <p className="about-desc">{t(getPlatform() === "linux" ? (canAutoInstallEngine(getPlatform(), backend) ? "linux.autoEngine" : "linux.engineGate") : (canAutoInstallEngine(getPlatform(), backend) ? "llama.desc" : "linux.manualEngine"))}</p>
               </div>
               <button
                 type="button"
@@ -616,15 +669,14 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
                       <button
                         type="button"
                         className="cuda-text-btn"
+                        disabled={!canAutoInstallEngine(getPlatform(), "cuda") || updating}
                         onClick={() => {
-                          setBackend("cuda");
-                          void onPersist({ ...config, llamaBackend: "cuda", llamaCudaVersion: cudaVersion }, "");
+                          selectEngine("cuda");
                           if (backend === "cuda") {
                             // 若已处于 CUDA 分支，再次点击 CUDA 文本也可顺畅触发/收起版本菜单
                             setCudaMenuOpen((prev) => !prev);
                           } else {
                             setCudaMenuOpen(false);
-                            if (remote) void ensureRemote("cuda", cudaVersion);
                           }
                         }}
                       >
@@ -634,12 +686,14 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
                       <button
                         type="button"
                         className={cn("cuda-dropdown-trigger", cudaMenuOpen && "open")}
+                        disabled={!canAutoInstallEngine(getPlatform(), "cuda") || updating}
                         onClick={(e) => {
                           e.stopPropagation();
                           if (backend !== "cuda") {
-                            setBackend("cuda");
-                            void onPersist({ ...config, llamaBackend: "cuda", llamaCudaVersion: cudaVersion }, "");
-                            if (remote) void ensureRemote("cuda", cudaVersion);
+                            selectEngine("cuda");
+                          } else {
+                            // CPU metadata can lack cudart assets: recheck on opening CUDA.
+                            void ensureRemote("cuda", cudaVersion);
                           }
                           setCudaMenuOpen((prev) => !prev);
                         }}
@@ -654,16 +708,14 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
                         <div className="cuda-version-dropdown-menu" onClick={(e) => e.stopPropagation()}>
                           <div className="cuda-dropdown-list">
                             {cudaSelectOptions.map((opt) => {
-                              const isSelected = cudaVersion === opt.value || (cudaVersion === "auto" && opt.value === "12");
+                              const isSelected = cudaVersion === opt.value;
                               return (
                                 <button
                                   key={opt.value}
                                   type="button"
                                   className={cn("cuda-dropdown-item", isSelected && "selected")}
                                   onClick={() => {
-                                    setCudaVersion(opt.value);
-                                    void onPersist({ ...config, llamaCudaVersion: opt.value, llamaBackend: "cuda" }, "");
-                                    if (remote) void ensureRemote("cuda", opt.value);
+                                    selectEngine("cuda", opt.value);
                                     setCudaMenuOpen(false);
                                   }}
                                 >
@@ -683,11 +735,10 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
                     <button
                       type="button"
                       className={cn("mini-seg-btn", backend === "vulkan" && "active")}
+                      disabled={updating}
                       onClick={() => {
                         setCudaMenuOpen(false);
-                        setBackend("vulkan");
-                        void onPersist({ ...config, llamaBackend: "vulkan" }, "");
-                        if (remote) void ensureRemote("vulkan", cudaVersion);
+                        selectEngine("vulkan");
                       }}
                     >
                       Vulkan
@@ -699,11 +750,10 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
                     <button
                       type="button"
                       className={cn("mini-seg-btn", backend === "cpu" && "active")}
+                      disabled={updating}
                       onClick={() => {
                         setCudaMenuOpen(false);
-                        setBackend("cpu");
-                        void onPersist({ ...config, llamaBackend: "cpu" }, "");
-                        if (remote) void ensureRemote("cpu", cudaVersion);
+                        selectEngine("cpu");
                       }}
                     >
                       CPU
@@ -726,12 +776,20 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
               </div>
             </div>
 
+            {getPlatform() === "linux" && backend === "cuda" && <>
+              {downloadInfo?.runtime && <p className="about-desc" role="status">{t("linux.cudaDownloadSize", {
+                engine: formatBytes(downloadInfo.engine.size), runtime: formatBytes(downloadInfo.runtime.size), total: formatBytes(downloadInfo.total),
+              })}</p>}
+              <p className="about-desc">{t("linux.cudaRuntimeHint")}</p>
+              <p className="about-desc">{t("linux.cudaCompatibility")}</p>
+            </>}
+
             {/* 右下角操作聚合 */}
             <div className="engine-unified-actions">
               <button
                 type="button"
                 className="secondary-button compact"
-                disabled={checking || updating}
+                disabled={!canAutoInstallEngine(getPlatform(), backend) || checking || updating}
                 onClick={() => void runCheck()}
               >
                 <RefreshCw size={13} className={checking ? "spin" : ""} />
@@ -742,7 +800,7 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
                 <button
                   type="button"
                   className="secondary-button compact"
-                  disabled={updating || checking}
+                  disabled={!canAutoInstallEngine(getPlatform(), backend) || updating || checking}
                   onClick={() => void forceReinstall()}
                 >
                   <RotateCw size={13} className={updating ? "spin" : ""} />
@@ -752,7 +810,7 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
                 <button
                   type="button"
                   className="engine-primary-btn compact"
-                  disabled={updating || checking}
+                  disabled={!canAutoInstallEngine(getPlatform(), backend) || updating || checking}
                   onClick={() => void startUpdate()}
                 >
                   {updating ? <Loader2 size={13} className="spin" /> : <Download size={13} />}
@@ -823,7 +881,7 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
               </div>
               <div className="settings-row">
                 <span className="settings-row-label">{t("st.trayTitle")}</span>
-                <span className="settings-row-desc">{t("st.trayDesc")}</span>
+                <span className="settings-row-desc">{t(getPlatform() === "linux" ? "linux.trayDesc" : "st.trayDesc")}</span>
                 <div className="settings-control">
                   <button className={"switch" + (trayOn ? " on" : "")} onClick={() => void onPersist({ ...config, minimizeToTrayOnClose: !trayOn }, trayOn ? t("toast.trayOff") : t("toast.trayOn"))} role="switch" aria-checked={trayOn}>
                     <span className="switch-knob" />
@@ -840,6 +898,7 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
           <div className="settings-card-body">
             <h3>{t("st.aboutTitle")}</h3>
             <p className="about-desc">{t("st.aboutDesc")}</p>
+            {!canAutoInstallApp(getPlatform(), appUpdate) && <p className="about-desc">{appUpdate?.installReason || t("linux.manualUpdate")}</p>}
             <div className="about-layout">
               <div className="about-info">
                 <span className="app-version-badge">{appVersion ? "v" + appVersion : "--"}{updateAvailable && <em className="version-new-badge">NEW</em>}</span>
@@ -888,8 +947,8 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
                     <Check size={24} strokeWidth={2.4} />
                   </div>
                   <div className="download-done-info">
-                    <h3>llama.cpp 运行时更新完成</h3>
-                    <p>{remote?.tag ? `${remote.tag} · ` : ""}已完成部署并热替换</p>
+                    <h3>{t("llama.progress.done")}</h3>
+                    <p>{remote?.tag ? `${remote.tag} · ` : ""}{t(getPlatform() === "linux" ? "linux.installed" : "llama.progress.done")}</p>
                   </div>
                 </div>
               ) : (
@@ -899,10 +958,10 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
                       <span className="download-status-dot" />
                       <span className="download-status-title">
                         {progress.phase === "extract"
-                          ? "正在解压部署…"
+                          ? t("llama.progress.extract", { percent: progressPercent })
                           : progress.phase === "install"
-                            ? "正在覆盖安装…"
-                            : "正在下载"}
+                            ? t(getPlatform() === "linux" ? "linux.installing" : "llama.progress.install")
+                            : t("llama.progress.download", { percent: progressPercent })}
                       </span>
                       {speedText && progress.phase === "download" && (
                         <span className="download-status-speed">{speedText}</span>
@@ -923,10 +982,10 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
                   <div className="download-minimal-sub">
                     <span className="download-minimal-hint">
                       {progress.phase === "extract"
-                        ? "解压部署中，请稍候…"
+                        ? t("llama.progress.extract", { percent: progressPercent })
                         : progress.phase === "install"
-                          ? "正在替换运行时文件…"
-                          : "更新中请保持应用开启，完成后自动替换"}
+                          ? t(getPlatform() === "linux" ? "linux.installing" : "llama.progress.install")
+                          : t("linux.keepOpen")}
                     </span>
                     <span className="download-minimal-tag">
                       {backend.toUpperCase()}{backend === "cuda" && cudaVersion && cudaVersion !== "auto" ? ` · CUDA ${cudaVersion}` : ""}
@@ -939,7 +998,7 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
             <footer>
               {progress.phase === "done" ? (
                 <button className="primary-button" onClick={() => setProgress(null)}>
-                  <Check size={14} />完成
+                  <Check size={14} />{t("llama.progress.done")}
                 </button>
               ) : updating ? (
                 <button className="secondary-button" onClick={() => void cancelUpdate()}>
@@ -947,7 +1006,7 @@ export default function SettingsPage({ visible, config, appUpdate, checkingUpdat
                 </button>
               ) : (
                 <button className="secondary-button" onClick={() => setProgress(null)}>
-                  <X size={14} />关闭
+                  <X size={14} />{t("win.close")}
                 </button>
               )}
             </footer>

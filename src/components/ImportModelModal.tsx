@@ -5,13 +5,14 @@ import { useI18n } from "../i18n";
 import { expandPaths, isTauri, pickFiles, pickFolder } from "../tauri";
 import type { PickedFile } from "../tauri";
 import { cn, fileName, formatBytes } from "../utils";
+import { pathIdentity } from "../platform";
 
 interface Candidate extends PickedFile {
   checked: boolean;
 }
 
 interface Props {
-  /** 仓库中已有模型的小写路径集合，用于标记重复项（默认不勾选） */
+  /** 仓库中已有模型的 pathIdentity 键集合，用于标记重复项（默认不勾选） */
   existingPaths: Set<string>;
   /** 确认后回调：传入用户勾选的文件，由 App 执行导入 */
   onImport: (paths: PickedFile[]) => Promise<void>;
@@ -53,16 +54,16 @@ export default function ImportModelModal({ existingPaths, onImport, onClose }: P
 
   const selected = useMemo(() => candidates.filter((item) => item.checked), [candidates]);
 
-  const isDup = (path: string) => existingPaths.has(path.toLowerCase());
+  const isDup = (path: string) => existingPaths.has(pathIdentity(path));
 
   /** 把新文件并入候选列表：按路径去重，已在仓库的项默认不勾选 */
   const merge = (items: PickedFile[]) => {
     setCandidates((previous) => {
-      const known = new Set(previous.map((item) => item.path.toLowerCase()));
+      const known = new Set(previous.map((item) => pathIdentity(item.path)));
       const fresh: Candidate[] = [];
       for (const item of items) {
         if (!item.path) continue;
-        const key = item.path.toLowerCase();
+        const key = pathIdentity(item.path);
         if (known.has(key)) continue;
         known.add(key);
         fresh.push({ ...item, checked: !isDup(item.path) && !fileName(item.path).toLowerCase().includes("mmproj") });

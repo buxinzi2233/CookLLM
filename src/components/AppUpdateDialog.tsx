@@ -1,69 +1,136 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, ArrowRight, CheckCircle2, Download, FileText, Loader2, PackageCheck, RefreshCw, Rocket, Sparkles, X } from "lucide-react";
 import { APP_VERSION } from "../data";
 import { useI18n } from "../i18n";
-import { cancelAppUpdate, downloadAppUpdate, installAppUpdate, onDownloadProgress, type DownloadProgress, type UpdateCheckResult } from "../tauri";
+import { openExternal, cancelAppUpdate, downloadAppUpdate, installAppUpdate, onDownloadProgress, type DownloadProgress, type UpdateCheckResult } from "../tauri";
 import { formatBytes, formatMB } from "../utils";
 
-type UpdatePhase = "info" | "download" | "ready" | "launch" | "error";
+import { acceptsDownloadProgress, canAutoInstallApp, getPlatform, installerPackageType } from "../platform";
+
+type UpdatePhase = "info" | "download" | "ready" | "launch" | "opened" | "cancel" | "error";
 
 export default function AppUpdateDialog({ open, update, onClose }: { open: boolean; update: UpdateCheckResult | null; onClose: () => void }) {
+  if (!open || !update) return null;
+  // A new resource or a reopened dialog owns a fresh session, never an old task's state.
+  const sessionKey = JSON.stringify([update.latestTag, update.assetUrl, update.assetName, update.assetSha256, update.assetSize, update.installKind, update.installSupported, update.installReason]);
+  return <AppUpdateSession key={sessionKey} update={update} onClose={onClose} />;
+}
+
+function AppUpdateSession({ update, onClose }: { update: UpdateCheckResult; onClose: () => void }) {
   const { t } = useI18n();
   const [phase, setPhase] = useState<UpdatePhase>("info");
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [installerPath, setInstallerPath] = useState("");
   const [error, setError] = useState("");
+  const [installMessage, setInstallMessage] = useState("");
+  const generation = useRef(0);
+  const mounted = useRef(true);
+  const busy = useRef<"download" | "cancel" | "install" | null>(null);
+  const autoInstall = canAutoInstallApp(getPlatform(), update);
+  const packageInstall = getPlatform() === "linux" && (update.installKind === "deb" || update.installKind === "rpm");
+  const installHint = getPlatform() === "linux" ? t(packageInstall ? "update.packageHint" : "update.appImageHint") : t("update.readyHint");
+  const isCurrent = (id: number) => mounted.current && generation.current === id;
 
   useEffect(() => {
-    if (!open) return;
-    setPhase("info");
-    setProgress(null);
-    setInstallerPath("");
-    setError("");
-  }, [open, update?.latestTag]);
+    mounted.current = true;
+    return () => { mounted.current = false; generation.current++; };
+  }, []);
 
   useEffect(() => {
-    if (!open || phase !== "download") return;
+    if (phase !== "download") return;
     let active = true;
+    const id = generation.current;
     const unlisten = onDownloadProgress((payload) => {
-      if (active) setProgress(payload);
+      if (active && isCurrent(id) && busy.current === "download" && acceptsDownloadProgress(payload, "app")) setProgress(payload);
     });
+    void unlisten.catch((caught) => { if (active && isCurrent(id)) setError(String(caught)); });
     return () => {
       active = false;
-      void unlisten.then((listener) => listener?.());
+      void unlisten.then((listener) => listener?.(), () => undefined);
     };
-  }, [open, phase]);
+  }, [phase]);
 
-  if (!open || !update) return null;
+  const closeDialog = () => {
+    generation.current++;
+    mounted.current = false;
+    onClose();
+  };
 
   const startDownload = async () => {
+    if (!canAutoInstallApp(getPlatform(), update)) { setError(update.installReason || t("linux.manualUpdate")); setPhase("error"); return; }
+    if (busy.current || !mounted.current) return;
+    const id = ++generation.current;
+    busy.current = "download";
     setPhase("download");
     setError("");
+    setInstallerPath("");
     setProgress(null);
     try {
       const path = await downloadAppUpdate(update);
+      if (!isCurrent(id)) return;
       setInstallerPath(path);
       setPhase("ready");
     } catch (caught) {
+      if (!isCurrent(id)) return;
       setError(caught instanceof Error ? caught.message : String(caught));
       setPhase("error");
+    } finally {
+      if (isCurrent(id)) busy.current = null;
     }
   };
 
   const cancelDownload = async () => {
-    await cancelAppUpdate();
-    setPhase("info");
+    if (busy.current !== "download") return;
+    // Invalidate download success/error before waiting for cancellation IPC.
+    const id = ++generation.current;
+    busy.current = "cancel";
+    setPhase("cancel");
     setProgress(null);
+    setInstallerPath("");
+    try {
+      await cancelAppUpdate();
+      if (isCurrent(id)) setPhase("info");
+    } catch (caught) {
+      if (!isCurrent(id)) return;
+      setError(caught instanceof Error ? caught.message : String(caught));
+      setPhase("error");
+    } finally {
+      if (isCurrent(id)) busy.current = null;
+    }
   };
 
   const startInstall = async () => {
+    if (!canAutoInstallApp(getPlatform(), update)) { setError(update.installReason || t("linux.manualUpdate")); setPhase("error"); return; }
+    if (busy.current || !mounted.current || !installerPath) return;
+    const id = ++generation.current;
+    busy.current = "install";
+    setError("");
     setPhase("launch");
     try {
-      await installAppUpdate(installerPath);
+      const result = await installAppUpdate(installerPath, update);
+      if (!isCurrent(id)) return;
+      if (result === null && getPlatform() === "windows") return;
+      if (result?.status === "restarting") {
+        setInstallMessage(result.message);
+      } else if (result?.status === "installer-opened") {
+        setInstallMessage(result.message);
+        setPhase("opened");
+      } else {
+        throw new Error(t("update.unknownResult"));
+      }
     } catch (caught) {
+      if (!isCurrent(id)) return;
       setError(caught instanceof Error ? caught.message : String(caught));
       setPhase("error");
+    } finally {
+      if (isCurrent(id)) busy.current = null;
     }
+  };
+
+  const openRelease = async () => {
+    const id = generation.current;
+    try { await openExternal(update.releaseUrl); }
+    catch (caught) { if (isCurrent(id)) { setError(String(caught)); setPhase("error"); } }
   };
 
   const speedText = progress?.speedBps ? `${formatBytes(progress.speedBps)}/s` : "";
@@ -73,10 +140,10 @@ export default function AppUpdateDialog({ open, update, onClose }: { open: boole
       : formatMB(progress.downloaded)
     : "";
   const percent = phase === "download" && progress ? Math.min(100, Math.max(0, progress.percent)) : phase === "ready" || phase === "launch" ? 100 : 0;
-  const canClose = phase === "info" || phase === "error";
+  const canClose = phase === "info" || phase === "error" || phase === "ready" || phase === "opened";
 
   return (
-    <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && canClose && onClose()}>
+    <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && canClose && closeDialog()}>
       <section className="import-modal update-modal" aria-live="polite" role="dialog" aria-modal="true">
         <header className="update-modal-header">
           <div className="update-modal-title">
@@ -84,7 +151,7 @@ export default function AppUpdateDialog({ open, update, onClose }: { open: boole
             <h2>{t("update.dialogTitle")}</h2>
             {update.latestTag && <span className="update-modal-tag">{update.latestTag}</span>}
           </div>
-          {canClose && <button className="ghost-icon" onClick={onClose} aria-label={t("cancel")}><X size={18} /></button>}
+          {canClose && <button className="ghost-icon" onClick={closeDialog} aria-label={t("cancel")}><X size={18} /></button>}
         </header>
 
         {phase === "download" ? (
@@ -93,7 +160,7 @@ export default function AppUpdateDialog({ open, update, onClose }: { open: boole
               <div className="download-minimal-header">
                 <div className="download-minimal-left">
                   <span className="download-status-dot" />
-                  <span className="download-status-title">正在下载安装包</span>
+                  <span className="download-status-title">{t("update.downloading")}</span>
                   {speedText && <span className="download-status-speed">{speedText}</span>}
                 </div>
                 <div className="download-minimal-right">
@@ -107,10 +174,10 @@ export default function AppUpdateDialog({ open, update, onClose }: { open: boole
               </div>
 
               <div className="download-minimal-sub">
-                <span className="download-minimal-hint">下载中请保持应用开启，完成后将自动继续</span>
+                <span className="download-minimal-hint">{t("update.keepOpen")}</span>
                 {update.assetName && (
                   <span className="download-minimal-tag">
-                    {update.assetName.toLowerCase().endsWith(".msi") ? "MSI 原地覆盖" : "EXE 安装包"}
+                    {installerPackageType(update.assetName)}
                   </span>
                 )}
               </div>
@@ -123,11 +190,15 @@ export default function AppUpdateDialog({ open, update, onClose }: { open: boole
                 <CheckCircle2 size={24} strokeWidth={2.4} />
               </div>
               <div className="download-done-info">
-                <h3>新版本安装包已就绪</h3>
-                <p>点击“立即安装”后应用将重启并自动完成覆盖升级</p>
+                <h3>{t("update.ready")}</h3>
+                <p>{installHint}</p>
               </div>
             </div>
           </div>
+        ) : phase === "opened" ? (
+          <div className="update-body"><h3>{t("update.installerOpened")}</h3><p>{installMessage}</p><p>{t("update.packageHint")}</p></div>
+        ) : phase === "cancel" ? (
+          <div className="update-body" role="status">{t("update.cancelling")}</div>
         ) : phase === "launch" ? (
           <div className="update-body">
             <div className="download-done-simple">
@@ -135,8 +206,8 @@ export default function AppUpdateDialog({ open, update, onClose }: { open: boole
                 <Loader2 size={24} />
               </div>
               <div className="download-done-info">
-                <h3>正在启动安装程序…</h3>
-                <p>{t("update.launching")}</p>
+                <h3>{t("update.launching")}</h3>
+                <p>{installMessage || installHint}</p>
               </div>
             </div>
           </div>
@@ -147,7 +218,7 @@ export default function AppUpdateDialog({ open, update, onClose }: { open: boole
                 <AlertTriangle size={24} />
               </div>
               <div className="download-done-info">
-                <h3>更新遇到问题</h3>
+                <h3>{t("update.failed")}</h3>
                 <p>{error}</p>
               </div>
             </div>
@@ -156,20 +227,20 @@ export default function AppUpdateDialog({ open, update, onClose }: { open: boole
           <div className="update-body">
             <div className="update-version-card">
               <div className="update-version-col">
-                <span className="update-version-tag">当前版本</span>
+                <span className="update-version-tag">{t("update.current")}</span>
                 <strong>v{APP_VERSION}</strong>
               </div>
               <div className="update-version-arrow">
                 <ArrowRight size={15} />
               </div>
               <div className="update-version-col highlight">
-                <span className="update-version-tag new">最新版本</span>
+                <span className="update-version-tag new">{t("update.latest")}</span>
                 <strong>{update.latestTag}</strong>
               </div>
               {update.assetName && (
                 <div className="update-asset-pill" title={update.assetName}>
                   <PackageCheck size={13} />
-                  <span>{update.assetName.toLowerCase().endsWith(".msi") ? "MSI 原地升级" : "EXE 安装包"}{update.assetSize ? ` · ${formatMB(update.assetSize)}` : ""}</span>
+                  <span>{installerPackageType(update.assetName)}{update.assetSize ? ` · ${formatMB(update.assetSize)}` : ""}</span>
                 </div>
               )}
             </div>
@@ -186,24 +257,36 @@ export default function AppUpdateDialog({ open, update, onClose }: { open: boole
           </div>
         )}
 
+        {!autoInstall && <p className="about-desc" role="status">{update.installReason || t("linux.manualUpdate")}</p>}
+        {autoInstall && phase === "info" && getPlatform() === "linux" && <p className="about-desc">{installHint}</p>}
+        {phase === "download" && error && <p role="alert">{error}</p>}
         <footer>
-          {phase === "ready" ? (
+          {!autoInstall ? (
             <>
-              <button className="secondary-button" onClick={onClose}>{t("update.later")}</button>
-              <button className="primary-button update-button" onClick={() => void startInstall()}><Rocket size={14} />{t("update.installReady")}</button>
+              <button className="secondary-button" onClick={closeDialog}>{t("update.later")}</button>
+              <button className="primary-button" onClick={() => void openRelease()}>{t("update.openRelease")}</button>
+            </>
+          ) : phase === "ready" ? (
+            <>
+              <button className="secondary-button" onClick={closeDialog}>{t("update.later")}</button>
+              <button className="primary-button update-button" onClick={() => void startInstall()}><Rocket size={14} />{t(packageInstall ? "update.openInstaller" : "update.installReady")}</button>
             </>
           ) : phase === "download" ? (
             <button className="secondary-button" onClick={() => void cancelDownload()}><X size={14} />{t("cancel")}</button>
+          ) : phase === "opened" ? (
+            <button className="secondary-button" onClick={closeDialog}>{t("cancel")}</button>
+          ) : phase === "cancel" ? (
+            <span className="download-footer-hint">{t("update.cancelling")}</span>
           ) : phase === "launch" ? (
-            <span className="download-footer-hint">准备就绪，软件即将重启…</span>
+            <span className="download-footer-hint">{t(packageInstall ? "update.launching" : "update.restarting")}</span>
           ) : phase === "error" ? (
             <>
-              <button className="secondary-button" onClick={onClose}>{t("update.later")}</button>
-              <button className="primary-button update-button" onClick={() => void startDownload()}><RefreshCw size={14} />{t("retry")}</button>
+              <button className="secondary-button" onClick={closeDialog}>{t("update.later")}</button>
+              <button className="primary-button update-button" onClick={() => void (installerPath ? startInstall() : startDownload())}><RefreshCw size={14} />{t("retry")}</button>
             </>
           ) : (
             <>
-              <button className="secondary-button" onClick={onClose}>{t("update.later")}</button>
+              <button className="secondary-button" onClick={closeDialog}>{t("update.later")}</button>
               <button className="primary-button update-button" onClick={() => void startDownload()}><Download size={14} />{t("update.installNow")}</button>
             </>
           )}

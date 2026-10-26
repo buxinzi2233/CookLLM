@@ -8,3 +8,5 @@ src-tauri/target/
 .idea/
 .vscode/
 .tmp/
+.snow/
+__pycache__/

@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import type { ServerStatus } from "../types";
 import { openExternal, writeClipboard } from "../tauri";
+import { dispatchWebUiMessage } from "../platform";
 import { cn } from "../utils";
 
 export default function Playground({
@@ -10,7 +11,6 @@ export default function Playground({
   status,
   webUiUrl,
   modelName,
-  onOpenWebUi,
   zenMode,
   onToggleZenMode,
 }: {
@@ -26,23 +26,34 @@ export default function Playground({
   /** 刷新内嵌 WebUI：key 变化时重建 iframe（服务重启后旧页面状态失效时用） */
   const [frameKey, setFrameKey] = useState(0);
 
+  const [frameState, setFrameState] = useState<"loading" | "loaded" | "slow" | "failed">("loading");
+  const [bridgeError, setBridgeError] = useState("");
   const frameRef = useRef<HTMLIFrameElement | null>(null);
   useEffect(() => {
+    setBridgeError("");
+    setFrameState("loading");
+    if (!status.running) return;
+    const timer = window.setTimeout(() => setFrameState((state) => state === "loading" ? "slow" : state), 15000);
+    return () => window.clearTimeout(timer);
+  }, [webUiUrl, frameKey, status.running]);
+
+  useEffect(() => {
     const onMessage = (event: MessageEvent) => {
-      if (!frameRef.current || event.source !== frameRef.current.contentWindow) return;
-      const data = event.data as { type?: string; text?: string; url?: string } | null;
-      if (!data || typeof data !== "object") return;
-      if (data.type === "cookllm:copy" && typeof data.text === "string") {
-        void writeClipboard(data.text).catch(() => {});
-      } else if (data.type === "cookllm:open" && typeof data.url === "string") {
-        void openExternal(data.url);
-      } else if (data.type === "cookllm:zen-toggle") {
-        onToggleZenMode?.();
-      }
+      if (!status.running) return;
+      void dispatchWebUiMessage(event, frameRef.current?.contentWindow, webUiUrl, {
+        copy: writeClipboard,
+        open: openExternal,
+        toggleZen: () => onToggleZenMode?.(),
+      }).then((action) => {
+        if (action) setBridgeError("");
+      }).catch((error) => {
+        const detail = error instanceof Error ? error.message : String(error);
+        setBridgeError(t("pg.bridgeError", { error: detail === "http-url-required" ? t("pg.httpOnly") : detail }));
+      });
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [onToggleZenMode]);
+  }, [onToggleZenMode, webUiUrl, status.running, t]);
 
   return (
     <div className="playground-pane" hidden={!visible}>
@@ -77,7 +88,7 @@ export default function Playground({
                 type="button"
                 className="chat-action-btn"
                 disabled={!status.running}
-                onClick={onOpenWebUi}
+                onClick={() => { setBridgeError(""); void openExternal(webUiUrl).catch((error) => setBridgeError(t("pg.bridgeError", { error: String(error) }))); }}
                 title={t("openInBrowser")}
                 aria-label={t("openInBrowser")}
               >
@@ -85,10 +96,12 @@ export default function Playground({
               </button>
             </div>
           </div>
+          {bridgeError && <p className="import-error" role="alert">{bridgeError}</p>}
+          {status.running && <p role="status" style={{ margin: "4px 12px", fontSize: 12 }}>{t(`pg.${frameState}`)}</p>}
           {status.running
             ? (
               <div className="native-frame-wrap">
-                <iframe ref={frameRef} key={`${webUiUrl}:${frameKey}`} src={webUiUrl} title="llama.cpp Web UI" allow="clipboard-read; clipboard-write" />
+                <iframe ref={frameRef} key={`${webUiUrl}:${frameKey}`} src={webUiUrl} onLoad={() => setFrameState("loaded")} onError={() => setFrameState("failed")} title="llama.cpp Web UI" allow="clipboard-read; clipboard-write" />
               </div>
             )
             : <div className="messages-empty"><Globe size={30} /><p>{t("pgNotRunning")}</p></div>}

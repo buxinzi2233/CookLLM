@@ -6,72 +6,143 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+# Serialize release runs; package jobs within one run still build in parallel.
+concurrency:
+  group: cookllm-release
+  cancel-in-progress: false
 
 jobs:
-  build-and-release-windows:
-    runs-on: windows-latest
-
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x86_64
+            node: '20'
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+            node: '22'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-
+          node-version: ${{ matrix.node }}
+      - name: Setup Rust (Linux)
+        if: runner.os == 'Linux'
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl wget file pkg-config libssl-dev libgtk-3-dev \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            patchelf rpm libfuse2
       - name: Install npm dependencies
         run: npm ci
-
-      - name: Build Tauri app (release)
+      - name: Build Tauri app (Windows release)
+        if: runner.os == 'Windows'
         run: npx tauri build
+      - name: Build Tauri app (Linux release)
+        if: runner.os == 'Linux'
+        env:
+          NO_STRIP: '1'
+        run: npm run build:linux -- --ci
+      - name: Upload Windows packages
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*.exe
+      - name: Upload Linux packages
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/rpm/*.rpm
+            src-tauri/target/release/bundle/appimage/*.AppImage
 
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Download all release packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-artifacts
+          merge-multiple: true
       - name: Create GitHub Release & Upload artifacts
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          VERSION=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          set -euo pipefail
+          VERSION=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/.*"\(.*\)".*/\1/' | tr -d '\r')
           TAG="v$VERSION"
-          if [ -n "$GITHUB_REF_NAME" ] && [[ "$GITHUB_REF_NAME" == v* ]]; then
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" == v* ]]; then
             TAG="$GITHUB_REF_NAME"
             VERSION="${TAG#v}"
-          else
-            VERSION=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/.*"\(.*\)".*/\1/' | tr -d '\r')
-            TAG="v$VERSION"
           fi
 
-          # Collect bundle artifacts (MSI + NSIS installers)
+          # Fail before publishing if any expected package format is missing.
           ARTIFACTS=()
-          for f in $(find src-tauri/target/release/bundle -type f \( -name '*.msi' -o -name '*.exe' \)); do
-            ARTIFACTS+=("$f")
+          for extension in msi exe deb rpm AppImage; do
+            mapfile -d '' -t MATCHES < <(find release-artifacts -type f -name "*.$extension" -print0)
+            if [ ${#MATCHES[@]} -eq 0 ]; then
+              echo "::error::Missing $extension release artifact"
+              exit 1
+            fi
+            ARTIFACTS+=("${MATCHES[@]}")
           done
+          declare -A ASSET_NAMES=()
+          for f in "${ARTIFACTS[@]}"; do
+            name=$(basename "$f")
+            if [[ -n "${ASSET_NAMES[$name]:-}" ]]; then
+              echo "::error::Duplicate release asset name: $name"
+              exit 1
+            fi
+            ASSET_NAMES[$name]=1
+          done
+          for f in "${ARTIFACTS[@]}"; do
+            (cd "$(dirname "$f")" && sha256sum "$(basename "$f")")
+          done > SHA256SUMS
+          ARTIFACTS+=(SHA256SUMS)
 
-          if [ ${#ARTIFACTS[@]} -eq 0 ]; then
-            echo "::error::No bundle artifacts found in src-tauri/target/release/bundle/"
-            exit 1
-          fi
-
-          echo "Creating release $TAG with ${#ARTIFACTS[@]} artifact(s):"
-          for f in "${ARTIFACTS[@]}"; do echo "  - $(basename "$f")"; done
-
-          # Generate release notes from CHANGELOG.md / README.md so the
-          # in-app updater never shows an empty changelog again.
+          # Reuse the existing versioned notes extractor and fallback.
           if python .github/scripts/get_release_notes.py --version "$VERSION" > notes.md; then
             NOTES_ARGS=(--notes-file notes.md)
           else
             NOTES_ARGS=(--notes "## $TAG")
           fi
 
-          # If triggered by tag push, the tag already exists on remote.
-          # For manual dispatch, create a new tag first.
-          if [ "${{ github.event_name }}" != "push" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "actions@github.com"
-            git tag "$TAG" -m "$TAG"
-            git push origin "$TAG"
+          # Only the original tag/manual workflow publishes. Manual runs may
+          # create a missing tag; reruns reuse an existing remote tag.
+          if [ "$GITHUB_EVENT_NAME" != push ]; then
+            if ! git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null; then
+              git config user.name "github-actions[bot]"
+              git config user.email "actions@github.com"
+              git tag "$TAG" -m "$TAG"
+              git push origin "$TAG"
+            fi
           fi
 
           if gh release view "$TAG" > /dev/null 2>&1; then
@@ -80,7 +151,7 @@ jobs:
           else
             gh release create "$TAG" \
               --title "CookLLM $TAG" \
-              --target master \
+              --target "$GITHUB_SHA" \
               --draft=false \
               --latest \
               "${NOTES_ARGS[@]}" \

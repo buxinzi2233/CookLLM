@@ -228,6 +228,81 @@ npm run tauri build
 
 ---
 
+## 🐧 Linux（x86_64，移植验证阶段）
+
+本节补充 Linux 使用方式；上文 Windows 的 `.exe` 引擎、MSI/NSIS 安装与自动应用更新说明不适用于 Linux。
+
+### 支持范围与当前证据
+
+- Linux 打包目标为 **deb / rpm / AppImage**，由 `src-tauri/tauri.linux.conf.json` 自动合并到基础配置；当前保持三种格式，尚未完成跨发行版安装验证。
+- 开发机 CachyOS x86_64（Rust 1.99、Node 26 / npm 12、GTK 3.24、WebKitGTK 4.1 2.54、OpenSSL 3.6）已完成三种包的本地构建。该结果不是最低 glibc / 发行版兼容承诺。前轮已有真实 CPU 桌面与独立 NVIDIA Vulkan/CUDA 微型模型推理证据，完整桌面/升级矩阵仍待验收。
+- CI 配置采用 Ubuntu 22.04 x86_64 / Node 22；云端执行与 Ubuntu 24.04 等运行环境仍待验证。无显示器 CI 的编译和测试不替代 X11 / Wayland 实机检查。
+- Linux 应用更新已按真实安装方式提供能力提示：**AppImage** 校验下载后同目录原子替换、保留旧备份，等待旧进程退出再重启，90 秒内未收到 React 启动确认则回退；**deb/rpm** 仅打开图形系统安装器，需用户确认，交接状态不代表升级完成。源码/未知安装布局、缺少所需工具或官方资产 digest 时显示手动安装原因，通过发布页下载对应包。
+- 第四轮已通过**本地模拟发布元数据＋真实旧 GUI `0.3.2` → 新 GUI `0.3.3` 跨版本升级**：真实 check/download/install IPC、helper 启动与 attached WebKit 原生版本读取、ready/startup-confirmed、旧 GUI 退出无交接重叠、升级前后重复启动单实例、CPU 停止及配置/模型/旧备份完整性均有证据；修复前的真实 90 秒回退证据保留。修复只将 FUSE 挂载唯一性限定在当前 GUI 的 exact APPDIR，仍校验只读/UID/source/fstype、runtime 设备/inode/open FD，未以环境变量替代身份核验。**`0.3.3` 仅为 `.tmp` 隔离测试快照，主仓库及当前三包仍是 `0.3.2`；正式 GitHub 线上发布与 deb/rpm 系统安装尚未验证。**
+- Linux x86_64 llama.cpp **CPU / Vulkan / CUDA 自动下载更新已实现并接通 UI**：从含所选后端资产的最高 `b` nightly 选择安装包，校验 SHA-256、大小与 URL，安装到独立托管目录，失败保留旧版及配置，不覆盖外部引擎。CUDA 支持 `auto / 12 / 13 / major.minor`；auto 按驱动上限优先兼容 12，再选 13，系统 `nvidia-smi` XML 探测限时 5 秒，驱动/配对资产缺失时有明确错误提示并保留手动入口。用户偏好与实际安装版本分开保存，CPU/Vulkan 安装不清 CUDA 偏好。
+- CUDA 下载同 tag、完整版本和架构的 **engine + 官方 cudart runtime 双包**；b11534 CUDA 12.8 两包合计约 **766 MB**，runtime 单包约 **594 MB**、展开约 **869 MB**，安装还需暂存/旧版空间。runtime 下载专用上限 1 GiB，不放宽 engine/App 的 512 MiB 上限。仅三类运行库及受限许可证内容安装到 appdata 私有 `cuda-runtime`，只给托管 CUDA 子进程设置私有 LD 路径并清 `LD_PRELOAD`；不复制 `/opt/resolve`、不装系统库，不强加到 CPU/手动外部引擎。用户直接下载官方 runtime，不代表独立再分发许可审计已完成。
+- 第三轮官方 12.8 双包通过校验、production 准备/合并/启动健康路径及真实 CUDA0 推理（`offloaded 6/6 layers`、health/chat 200、非空 16 tokens、端口释放）。**CUDA 13/13.4 只有 metadata/pair/selection 测试，未实包运行**；微型模型不作性能宣传。
+- **NInfer 当前官方版**要求 64 位 Linux，锁定 **sm120a**、选定/验证 **RTX 5090**；CUDA 13.1 是已验证工具链，CMake 未设置 CUDA 版本下限；当前设计为单 GPU、单常驻模型、无 CPU offload。**不是所有 50 系通用保证，更不是所有社区 fork 都要求 50 系**；本机 RTX 4070 Laptop sm89 不满足官方版，fork 需独立验证，Linux NInfer 运行仍未验。[NInfer README](https://github.com/Neroued/ninfer/blob/HEAD/README.md "官方说明 64 位 Linux、RTX 5090、sm120a 构建限制及单 GPU 常驻模型") [NInfer CMake](https://github.com/Neroued/ninfer/blob/HEAD/CMakeLists.txt "官方构建锁定 120a，未设置 CUDA 工具链版本下限")
+- 第三轮原生包的独立 Wayland seat **10/10** 真实交互通过，包含 iframe textarea 输入并点击 Send（非 fetch 替代）、中文多行 native 剪贴板/日志复制、预设选择与启停、task UI 大小写文件删除、窗口关闭清理。导入使用 Tauri drag 事件 fixture，非物理拖拽/原生文件选择器。真实本地下载 IPC **8/8** 覆盖暂停续传、流/停滞取消、Range 失败和目标冲突；未替代外网 HF/代理与下载按钮 UI。
+- 第四轮桌面服务汇总 **9 项功能通过＋1 项渲染 partial**：真实 Thunar 定位 **4/4**（打开文件 parent/直接目录，不声称选中文件），GI/GTK 测试 consumer 下原生 SNI/DBusMenu **5/5**（Close 隐藏但 app/CPU 继续、show 恢复、重复启动单实例恢复、quit 清理）。图标截图可见，GTK 菜单标签截图被裁，物理鼠标菜单/真实发行版 panel 未验；测试 host 不是发行版 panel。这组使用第三轮 native 包，不标为最新 root 包重验。
+- 当前主仓库 `0.3.2` 的 check 零 Rust warning、Rust 库 **125 passed / 0 failed / 3 ignored**、三包构建通过；路径 **18** / UI **61** 沿用第三轮，本轮未重新执行 Node tests，打包内 `tsc/Vite` 实际通过。完整 SHA、按轮日志及保留的失败/工具诊断见 [Linux 累计验收记录](docs/Linux验收记录.md)。
+
+### 依赖与源码构建
+
+需要 Node.js 22、Rust stable 工具链和 Linux 桌面运行环境。Ubuntu 22.04 启用 universe 软件源后，可安装以下构建依赖；WebKitGTK 4.1 的开发包名为 `libwebkit2gtk-4.1-dev`，并非 4.0 包。[Ubuntu 包目录](https://packages.ubuntu.com/jammy/libwebkit2gtk-4.1-dev "Ubuntu 22.04 提供 WebKitGTK 4.1 开发包及 GTK 3 依赖")
+
+```bash
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends \
+  build-essential curl wget file pkg-config libssl-dev libgtk-3-dev \
+  libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+  patchelf rpm libfuse2
+
+# 仓库根目录：依赖准备、桌面调试、正式打包
+npm ci
+npm run tauri dev
+npm run build:linux
+
+# 可选：仅打 deb；-- 后的参数原样传给本地 Tauri CLI
+npm run build:linux -- --bundles deb
+```
+
+当前锁文件含 `registry.npmmirror.com` 下载地址。本机 npm 12 的安装验证使用 `npm ci --registry=https://registry.npmmirror.com`；按网络情况选择命令，该参数仅作用于本次安装，不修改全局 npm 配置，也不改锁文件中的来源。
+
+`build:linux` 仅在 Linux 运行，默认给子进程设置 `NO_STRIP=1`（保留用户已设置的值）。这是针对 linuxdeploy 内置旧 `strip` 解析较新系统库 `.relr.dyn` 失败的兼容措施，**不改变本应用 Cargo release 的 `strip=true` 和编译优化**，也不影响 Windows 的 `npm run tauri build`。不要将该变量写入系统全局环境。
+
+包输出位置：
+
+- `src-tauri/target/release/bundle/deb/*.deb`
+- `src-tauri/target/release/bundle/rpm/*.rpm`
+- `src-tauri/target/release/bundle/appimage/*.AppImage`
+
+### 安装、引擎与桌面排查
+
+- deb：在对应 Ubuntu / Debian 桌面上通过系统软件安装器或 `sudo apt install ./实际文件名.deb` 安装，让包管理器处理依赖。
+- rpm：在对应 RPM 系桌面上通过系统软件安装器或 `sudo dnf install ./实际文件名.rpm` 安装，发行版适配仍需实测。
+- AppImage：对下载文件添加执行权限（`chmod +x ./实际文件名.AppImage`）后启动。目标系统仍需兼容的 glibc / 图形栈；若提示 FUSE 依赖缺失，按发行版安装 FUSE 2 兼容库（Ubuntu 22.04 为 `libfuse2`）。
+- 在引擎管理/设置中手动选择 **Linux x86_64 的 `llama-server`**，保留配套 `.so` 与目录布局，确认可执行权限、CPU 指令集和 GPU 运行库匹配；Windows `.exe` 引擎应重新定位。导入 GGUF 后配置预设并验证启停、日志和聊天。
+- 文件与模型路径区分大小写；配置和模型继续使用 Tauri 平台用户目录或用户自选目录。升级前备份配置，保留模型和外部引擎目录。
+- Linux 模型下载支持异步暂停/续传/取消，临时文件用完整文件名追加 `.part`（`model.gguf.part`）及自有 `.part.cookllm.json`，以 ETag/Last-Modified 的 If-Range 校验来源；206 严格校验、200 忽略 Range 时重写，错误不完成/不覆盖旧文件。暂停保留缓存、取消清理后停止写入；删除暂停 partial 会清自有 sidecar，未知 JSON/符号链接保留。旧 `model.part` 缓存不自动迁移；Windows transfer 保留，命名变化仍待实机回归。
+- NVIDIA 监控依赖驱动提供的 `nvidia-smi`，可先在终端运行该命令；没有 NVIDIA 的机器按界面状态使用其他后端。剪贴板/目录定位还依赖桌面会话和对应工具（如 Wayland 的 `wl-copy`、X11 的 `xclip` / `xsel`、`xdg-open`）。
+
+若 NVIDIA / WebKitGTK 出现空白或渲染异常，可从仓库根目录尝试以下**仅当前进程有效**的诊断命令；正常渲染时无需设置：
+
+```bash
+GDK_BACKEND=x11 WEBKIT_DISABLE_DMABUF_RENDERER=1 ./src-tauri/target/release/cookllm
+# Wayland 会话下的可选对照（需已有有效 Wayland 桌面会话）
+GDK_BACKEND=wayland ./src-tauri/target/release/cookllm
+# 本地 0.3.2 AppImage：局部禁用 DMABUF 渲染，不写入全局环境
+WEBKIT_DISABLE_DMABUF_RENDERER=1 ./src-tauri/target/release/bundle/appimage/CookLLM_0.3.2_amd64.AppImage
+```
+
+本机曾在独立 XDG 目录和 `dbus-run-session` 下进行一次隔离启动冒烟：native Wayland 上报 React 首屏 1681 ms；native X11 配合 `WEBKIT_DISABLE_DMABUF_RENDERER=1` 为 423 ms，二者观察 10 秒未提前退出或 panic。**AppImage 默认 Wayland 出现 GBM 错误且未上报 React，首屏冒烟失败**；局部设置上述变量后上报 React 591 ms，观察 12 秒未提前退出或 panic。这是单次环境记录，不是启动性能保证，也不代表 AppImage 无条件运行通过。
+
+这些启动参数不修改用户系统环境。Linux 首屏已采用先显示窗口再等待 rAF，解决隐藏窗口等待约 8 秒的首帧停顿；Windows 保留双帧等待，运行回归仍待执行。Linux 托盘默认关闭，托盘故障时窗口保持可见；前轮 X11 CPU 聊天/配置恢复、第三轮独立 Wayland 交互，以及第四轮 Thunar 定位/原生 tray 协议已有分项实测。GTK 菜单可视确认仅 partial，发行版 panel/物理鼠标菜单、picker/drag、有/无 NVIDIA 与完整桌面矩阵仍待验。维护者 CI 与发布边界见 [Linux 发布说明](docs/发布指引.md#七linux-构建与发布补充)。
+
+---
+
 ## 👥 社区与支持
 
 访问 [LINUX DO](https://linux.do)，与开发者和技术爱好者交流。

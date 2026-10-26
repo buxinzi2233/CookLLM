@@ -17,6 +17,15 @@ use tauri::{
 };
 use tauri_plugin_dialog::DialogExt;
 
+#[cfg(target_os = "linux")]
+mod platform;
+#[cfg(target_os = "linux")]
+mod linux_engine_update;
+#[cfg(target_os = "linux")]
+mod linux_app_update;
+#[cfg(all(test, target_os = "linux"))]
+mod linux_port_tests;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelAsset {
@@ -394,7 +403,10 @@ struct ManagedProcess {
 
 /// 本进程托管的 llama-server；None 表示未运行。
 #[derive(Default)]
-struct ProcessState(Mutex<Option<ManagedProcess>>);
+struct ProcessState(
+    Mutex<Option<ManagedProcess>>,
+    #[cfg(target_os = "linux")] Mutex<HashMap<u32, platform::ProcessIdentity>>,
+);
 
 #[derive(Default)]
 struct TimingState(Mutex<StartupTiming>);
@@ -466,34 +478,40 @@ fn stream_reader<R: std::io::Read + Send + 'static>(app: AppHandle, stream: &'st
     });
 }
 
-/// 强制终止托管子进程（llama-server），三处出口共用：退出时 / 停止服务 / 重启服务。
-/// - Windows：taskkill /T /F（与"停止服务"按钮一致，最可靠，连带整棵进程树），
-///   此前退出路径用 in-process Child::kill 无法可靠杀掉 llama-server，导致它留在后台占显存。
-/// - 非 Windows：Child::kill。
-///
-/// 之后带 5 秒超时轮询 wait：确保进程被回收，同时绝不无限阻塞调用线程（退出流程同样安全）。
-fn kill_managed_child(managed: &mut ManagedProcess) {
-    #[cfg(windows)]
+/// Linux 状态检查保留已退出组长的 PID，直到整个托管组清理完成。
+fn managed_child_exited(managed: &mut ManagedProcess) -> Result<bool, String> {
+    #[cfg(target_os = "linux")]
+    { platform::child_exited(&managed.child).map_err(|e| e.to_string()) }
+    #[cfg(not(target_os = "linux"))]
+    { managed.child.try_wait().map(|status| status.is_some()).map_err(|e| e.to_string()) }
+}
+
+/// 停止托管进程：Linux 温和退出后限时清理整个独立组；Windows 保持 taskkill 树清理。
+fn kill_managed_child(managed: &mut ManagedProcess) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    { platform::stop_group(&mut managed.child, std::time::Duration::from_millis(800)).map_err(|e| e.to_string()) }
+    #[cfg(not(target_os = "linux"))]
     {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW：避免拉起 taskkill 时闪出控制台窗口
-        let _ = Command::new("taskkill")
-            .args(["/PID", &managed.child.id().to_string(), "/T", "/F"])
-            .creation_flags(0x08000000)
-            .output();
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = managed.child.kill();
-    }
-    let deadline = now_ms() + 5000;
-    loop {
-        match managed.child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if now_ms() >= deadline => break,
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-            Err(_) => break,
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let _ = Command::new("taskkill")
+                .args(["/PID", &managed.child.id().to_string(), "/T", "/F"])
+                .creation_flags(0x08000000)
+                .output();
         }
+        #[cfg(not(windows))]
+        { let _ = managed.child.kill(); }
+        let deadline = now_ms() + 5000;
+        loop {
+            match managed.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if now_ms() >= deadline => break,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -520,14 +538,8 @@ fn get_process_path(pid: u32) -> Option<String> {
     }
 }
 
-#[cfg(not(windows))]
-fn get_process_path(pid: u32) -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(dest) = fs::read_link(format!("/proc/{}/exe", pid)) {
-            return Some(dest.to_string_lossy().to_string());
-        }
-    }
+#[cfg(not(any(windows, target_os = "linux")))]
+fn get_process_path(_pid: u32) -> Option<String> {
     None
 }
 
@@ -548,6 +560,7 @@ struct OrphanServerInfo {
 }
 
 /// 收集配置中已登记的所有 server 可执行程序文件名（包括默认路径与多分支）
+#[cfg(not(target_os = "linux"))]
 fn collect_configured_exe_names(config: Option<&AppConfig>) -> Vec<String> {
     let mut names = Vec::new();
     if let Some(cfg) = config {
@@ -573,6 +586,7 @@ fn collect_configured_exe_names(config: Option<&AppConfig>) -> Vec<String> {
 }
 
 /// 探测系统中未被 CookLLM 当前生命周期托管的 server 进程（包括 llama-server 与分支自定义名称，如 llama-kvmem-server.exe）
+#[cfg(not(target_os = "linux"))]
 fn find_orphan_servers(managed_pid: Option<u32>, custom_exe_names: &[String]) -> Vec<OrphanProcessItem> {
     #[cfg(windows)]
     {
@@ -661,28 +675,83 @@ fn find_orphan_servers(managed_pid: Option<u32>, custom_exe_names: &[String]) ->
     }
 }
 
+#[cfg(target_os = "linux")]
+fn configured_engine_paths(config: &AppConfig) -> Vec<PathBuf> {
+    // Full paths only: a configured basename must not authorize other directories.
+    std::iter::once(config.server_path.as_str()).chain(config.engines.iter().map(|e| e.path.as_str()))
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| fs::canonicalize(p).ok())
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn find_orphan_servers(managed_pid: Option<u32>, paths: &[PathBuf]) -> Vec<platform::ProcessIdentity> {
+    platform::discover_engines(paths, managed_pid)
+}
+
+/// Linux 外部清理仅作用于上次发现且本次重新核验的明确 PID，不清理其进程组。
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn kill_orphan_server(app: AppHandle, state: State<ProcessState>, pids: Option<Vec<u32>>) -> Result<usize, String> {
+    let _lifecycle = PROCESS_LIFECYCLE_LOCK.lock().map_err(|_| "进程生命周期锁已损坏")?;
+    let managed_pid = state.0.lock().map_err(|_| "进程状态锁已损坏")?.as_ref().map(|m| m.child.id());
+    let mut pids = pids.filter(|p| !p.is_empty()).ok_or("请先检查后台引擎并明确选择待清理的 PID")?;
+    pids.sort_unstable();
+    pids.dedup();
+    let config = read_config(&app)?;
+    let paths = configured_engine_paths(&config);
+    let mut discovered = state.1.lock().map_err(|_| "发现进程锁已损坏")?;
+    // Validate the entire selection before sending any signal. pidfds pin process identity.
+    let handles = pids.iter().map(|pid| {
+        let expected = discovered.get(pid).ok_or_else(|| format!("PID {pid} 未出现在已发现的引擎列表，请刷新"))?;
+        platform::verified_pidfd(expected, &paths, managed_pid)
+    }).collect::<Result<Vec<_>, String>>()?;
+    for (pid, fd) in pids.iter().zip(&handles) {
+        platform::stop_external(fd, std::time::Duration::from_millis(800))?;
+        discovered.remove(pid);
+    }
+    Ok(handles.len())
+}
+
 /// 检查是否存在后台残留的 server 进程
 #[tauri::command]
 fn check_orphan_server(app: AppHandle, state: State<ProcessState>) -> Result<OrphanServerInfo, String> {
+    #[cfg(target_os = "linux")]
+    let _lifecycle = PROCESS_LIFECYCLE_LOCK.lock().map_err(|_| "进程生命周期锁已损坏")?;
     let managed_pid = {
         let mut guard = state.0.lock().map_err(|_| "进程状态锁已损坏")?;
         if let Some(managed) = guard.as_mut() {
-            match managed.child.try_wait() {
-                Ok(Some(_)) => {
-                    *guard = None;
-                    None
-                }
-                Ok(None) => Some(managed.child.id()),
-                Err(_) => None,
+            if managed_child_exited(managed)? {
+                #[cfg(target_os = "linux")]
+                kill_managed_child(managed)?;
+                *guard = None;
+                None
+            } else {
+                Some(managed.child.id())
             }
         } else {
             None
         }
     };
 
-    let config = read_config(&app).ok();
-    let custom_exe_names = collect_configured_exe_names(config.as_ref());
-    let processes = find_orphan_servers(managed_pid, &custom_exe_names);
+    #[cfg(not(target_os = "linux"))]
+    let processes = {
+        let config = read_config(&app).ok();
+        let custom_exe_names = collect_configured_exe_names(config.as_ref());
+        find_orphan_servers(managed_pid, &custom_exe_names)
+    };
+    #[cfg(target_os = "linux")]
+    let processes = {
+        let config = read_config(&app)?;
+        let discovered = find_orphan_servers(managed_pid, &configured_engine_paths(&config));
+        let items = discovered.iter().map(|p| OrphanProcessItem {
+            pid: p.pid,
+            name: p.exe.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+            path: Some(p.exe.to_string_lossy().into_owned()),
+        }).collect::<Vec<_>>();
+        *state.1.lock().map_err(|_| "发现进程锁已损坏")? = discovered.into_iter().map(|p| (p.pid, p)).collect();
+        items
+    };
     let pids = processes.iter().map(|p| p.pid).collect();
     Ok(OrphanServerInfo {
         has_orphan: !processes.is_empty(),
@@ -692,6 +761,7 @@ fn check_orphan_server(app: AppHandle, state: State<ProcessState>) -> Result<Orp
 }
 
 /// 终止指定的（或全部未托管的）后台残留 server 进程
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 fn kill_orphan_server(app: AppHandle, state: State<ProcessState>, pids: Option<Vec<u32>>) -> Result<usize, String> {
     let managed_pid = {
@@ -772,6 +842,8 @@ mod titlebar {
 /// 按应用主题同步系统标题栏：暗色主题时让 Windows 窗口标题栏变黑，亮色恢复默认。
 #[tauri::command]
 fn set_window_theme(window: tauri::WebviewWindow, dark: bool) -> Result<(), String> {
+    #[cfg(not(target_os = "windows"))]
+    let _ = (window, dark);
     #[cfg(target_os = "windows")]
     {
         let hwnd = window.hwnd().map_err(|error| error.to_string())?;
@@ -785,6 +857,10 @@ fn set_window_theme(window: tauri::WebviewWindow, dark: bool) -> Result<(), Stri
 #[tauri::command]
 fn save_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
     let path = config_path(&app)?;
+    if cfg!(target_os = "linux") {
+        #[cfg(target_os = "linux")]
+        return linux_engine_update::save_config_atomic(&path, &config);
+    }
     let temporary = path.with_extension("json.tmp");
     let backup = path.with_extension("json.bak");
     let contents = serde_json::to_vec_pretty(&config).map_err(|error| error.to_string())?;
@@ -851,6 +927,12 @@ fn start_server(app: AppHandle, state: State<ProcessState>, model_id: String, pr
     if !PathBuf::from(&chosen_path).exists() {
         return Err(format!("引擎 Server 文件不存在：{}", chosen_path));
     }
+    #[cfg(target_os = "linux")]
+    let chosen_path = {
+        let path = fs::canonicalize(&chosen_path).map_err(|e| format!("读取引擎路径失败：{e}"))?;
+        platform::validate_engine(&path)?;
+        path.to_string_lossy().into_owned()
+    };
     if !PathBuf::from(&model.path).exists() {
         return Err(format!("模型文件不存在：{}", model.path));
     }
@@ -867,21 +949,30 @@ fn start_server(app: AppHandle, state: State<ProcessState>, model_id: String, pr
         }
     }
 
+    // 在停止已有服务前校验引号，避免拼写错误被静默丢弃。
+    let extra_tokens = shlex::split(&profile.extra_args).ok_or("附加参数引号或转义不完整，请检查运行预设")?;
+
+    let mut command = Command::new(&chosen_path);
+    #[cfg(target_os = "linux")]
+    linux_engine_update::managed_launch_env(&mut command, Path::new(&chosen_path),
+        &app.path().app_data_dir().map_err(|e| e.to_string())?.join("llamacpp-managed"))?;
+
     // 进程生命周期串行化：kill 旧进程的等待在专用锁内进行，ProcessState 锁只做短暂存取
     let lifecycle = PROCESS_LIFECYCLE_LOCK.lock().map_err(|_| "进程生命周期锁已损坏")?;
     let previous = { state.0.lock().map_err(|_| "进程状态锁已损坏")?.take() };
     if let Some(mut running) = previous {
-        kill_managed_child(&mut running);
+        if let Err(error) = kill_managed_child(&mut running) {
+            *state.0.lock().map_err(|_| "进程状态锁已损坏")? = Some(running);
+            return Err(error);
+        }
     }
 
-    // 解析 extra_args 用于防冲突去重检测与后续参数拼接
-    let extra_tokens = shlex::split(&profile.extra_args).unwrap_or_default();
+    // 解析后的 extra_args 用于防冲突去重检测与后续参数拼接
     let has_extra_arg = |flag: &str| -> bool {
         extra_tokens.iter().any(|arg| arg == flag || arg.starts_with(&format!("{flag}=")))
     };
 
     let engine_type = detect_engine_type(&chosen_path);
-    let mut command = Command::new(&chosen_path);
 
     if engine_type == "ninfer" || engine_type == "ninfer_kvmem" {
         // 1. 模型路径：必须作为首个位置参数，绝对不能加 -m
@@ -953,7 +1044,7 @@ fn start_server(app: AppHandle, state: State<ProcessState>, model_id: String, pr
             if let Ok(app_dir) = app.path().app_data_dir() {
                 use std::hash::{Hash, Hasher};
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                chosen_path.to_lowercase().hash(&mut hasher);
+                path_dedupe_key(&chosen_path).hash(&mut hasher);
                 let hash_hex = format!("{:016x}", hasher.finish());
                 let profiles_dir = app_dir.join("device_profiles");
                 let _ = std::fs::create_dir_all(&profiles_dir);
@@ -1183,8 +1274,18 @@ fn start_server(app: AppHandle, state: State<ProcessState>, model_id: String, pr
         command.creation_flags(0x08000000);
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     emit_log(&app, "system", format!("launch: {} · {} [engine: {}]", model_display_name, profile.name, engine_display_name));
-    let mut child = command.spawn().map_err(|error| format!("启动失败：{error}"))?;
+    let mut child = command.spawn().map_err(|error| {
+        #[cfg(target_os = "linux")]
+        { platform::spawn_error(error) }
+        #[cfg(not(target_os = "linux"))]
+        { format!("启动失败：{error}") }
+    })?;
     let pid = child.id();
     if let Some(stdout) = child.stdout.take() {
         stream_reader(app.clone(), "stdout", stdout);
@@ -1219,7 +1320,10 @@ fn stop_server(app: AppHandle, state: State<ProcessState>) -> Result<ServerStatu
     let lifecycle = PROCESS_LIFECYCLE_LOCK.lock().map_err(|_| "进程生命周期锁已损坏")?;
     let managed = { state.0.lock().map_err(|_| "进程状态锁已损坏")?.take() };
     if let Some(mut managed) = managed {
-        kill_managed_child(&mut managed);
+        if let Err(error) = kill_managed_child(&mut managed) {
+            *state.0.lock().map_err(|_| "进程状态锁已损坏")? = Some(managed);
+            return Err(error);
+        }
         emit_log(&app, "system", "llama-server 已停止");
     } else {
         emit_log(&app, "system", "llama-server 未在运行");
@@ -1233,10 +1337,13 @@ fn stop_server(app: AppHandle, state: State<ProcessState>) -> Result<ServerStatu
 fn get_server_status(state: State<ProcessState>) -> Result<ServerStatus, String> {
     let mut guard = state.0.lock().map_err(|_| "进程状态锁已损坏")?;
     if let Some(managed) = guard.as_mut() {
-        match managed.child.try_wait() {
-            Ok(Some(_)) => { *guard = None; Ok(ServerStatus::default()) }
-            Ok(None) => Ok(managed.status.clone()),
-            Err(error) => Err(error.to_string()),
+        if managed_child_exited(managed)? {
+            #[cfg(target_os = "linux")]
+            kill_managed_child(managed)?;
+            *guard = None;
+            Ok(ServerStatus::default())
+        } else {
+            Ok(managed.status.clone())
         }
     } else {
         Ok(ServerStatus::default())
@@ -1253,10 +1360,27 @@ struct GpuStats {
     power_watts: Option<f64>,
 }
 
-/// nvidia-smi 路径缓存（None = 本会话未找到，避免每轮重复拉起 cmd 搜索 PATH）。
+/// nvidia-smi 成功寻址缓存；Linux 直接检查 PATH 中的可执行文件。
 static SMI_PATH_CACHE: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// 防止 GPU 查询堆积：上一轮还没返回时直接跳过本轮。
 static GPU_QUERY_BUSY: AtomicBool = AtomicBool::new(false);
+
+struct BusyGuard<'a>(&'a AtomicBool);
+impl<'a> BusyGuard<'a> {
+    fn acquire(flag: &'a AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).ok().map(|_| Self(flag))
+    }
+}
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+}
+
+fn gpu_command_output(command: &mut Command) -> Option<std::process::Output> {
+    #[cfg(target_os = "linux")]
+    { platform::checked_tool(command, None, std::time::Duration::from_secs(2)).ok() }
+    #[cfg(not(target_os = "linux"))]
+    { command.output().ok().filter(|output| output.status.success()) }
+}
 
 fn find_nvidia_smi() -> Option<PathBuf> {
     let mut cache = SMI_PATH_CACHE.lock().ok()?;
@@ -1264,6 +1388,9 @@ fn find_nvidia_smi() -> Option<PathBuf> {
         return Some(path.clone());
     }
     // 1) NVIDIA 驱动把 nvidia-smi 随 System32 安装，优先直取（零额外进程）
+    #[cfg(target_os = "linux")]
+    let found = platform::find_in_path("nvidia-smi", std::env::var_os("PATH").as_deref());
+    #[cfg(not(target_os = "linux"))]
     let found = std::env::var("SystemRoot")
         .ok()
         .map(|root| PathBuf::from(root).join(r"system32\nvidia-smi.exe"))
@@ -1295,7 +1422,11 @@ fn find_nvidia_smi() -> Option<PathBuf> {
 
 /// 查询一次 GPU 指标（单位 MiB / % / W）；多卡取第一行即 GPU0。无 NVIDIA 驱动时返回 None。
 fn query_gpu_stats() -> Option<GpuStats> {
-    let path = find_nvidia_smi()?;
+    let _busy = BusyGuard::acquire(&GPU_QUERY_BUSY)?;
+    query_gpu_stats_at(&find_nvidia_smi()?)
+}
+
+fn query_gpu_stats_at(path: &Path) -> Option<GpuStats> {
     let mut command = std::process::Command::new(&path);
     command
         .args([
@@ -1310,19 +1441,18 @@ fn query_gpu_stats() -> Option<GpuStats> {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
-    let output = command.output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    let output = gpu_command_output(&mut command)?;
     let text = String::from_utf8(output.stdout).ok()?;
     let line = text.lines().find(|line| !line.trim().is_empty())?;
     let fields: Vec<&str> = line.split(',').map(|field| field.trim()).collect();
+    if fields.len() != 4 { return None; }
+    let number = |value: &&str| value.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0);
     Some(GpuStats {
-        memory_total_mb: fields.first().and_then(|value| value.parse::<f64>().ok()),
-        memory_used_mb: fields.get(1).and_then(|value| value.parse::<f64>().ok()),
-        util_percent: fields.get(2).and_then(|value| value.parse::<f64>().ok()),
+        memory_total_mb: fields.first().and_then(number),
+        memory_used_mb: fields.get(1).and_then(number),
+        util_percent: fields.get(2).and_then(number),
         // 个别卡型不支持功耗读数（输出 "N/A"）→ None，前端回退为仅显示 Idle
-        power_watts: fields.get(3).and_then(|value| value.parse::<f64>().ok()),
+        power_watts: fields.get(3).and_then(number),
     })
 }
 
@@ -1334,7 +1464,7 @@ struct HardwareInfo {
     supported: bool,
     /// GPU 总显存（MiB；无独显或非 NVIDIA 驱动时为空）
     vram_total_mb: Option<f64>,
-    /// Windows 可见总物理内存（MiB）；非 Windows 平台为空
+    /// 可见总物理内存（MiB）；查询失败时为空
     system_ram_mb: Option<f64>,
 }
 
@@ -1351,6 +1481,12 @@ struct GpuInfo {
 /// AMD 通过 atiadlxx.dll（System32）存在性判断，其余视为未知。
 #[tauri::command]
 fn get_gpu_info() -> GpuInfo {
+    #[cfg(target_os = "linux")]
+    let (vendor, supported, vram_total_mb) = match query_gpu_stats().and_then(|stats| stats.memory_total_mb).filter(|v| *v > 0.0) {
+        Some(total) => ("nvidia".to_string(), true, Some(total)),
+        None => ("unknown".to_string(), false, None),
+    };
+    #[cfg(not(target_os = "linux"))]
     let (vendor, supported, vram_total_mb) = if find_nvidia_smi().is_some() {
         (
             "nvidia".to_string(),
@@ -1377,16 +1513,7 @@ fn get_gpu_info() -> GpuInfo {
 #[tauri::command]
 async fn get_gpu_stats() -> Result<Option<GpuStats>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        // 上一轮查询仍在运行（驱动卡住）：跳过本轮，避免进程堆积
-        if GPU_QUERY_BUSY
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {
-            return None;
-        }
-        let stats = query_gpu_stats();
-        GPU_QUERY_BUSY.store(false, Ordering::Relaxed);
-        stats
+        query_gpu_stats()
     })
     .await
     .map_err(|_| "GPU 查询任务已中断".into())
@@ -1406,24 +1533,19 @@ fn total_system_memory_mb() -> Option<f64> {
     Some(total_kb as f64 / 1024.0)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn total_system_memory_mb() -> Option<f64> {
-    None
+    platform::memory_from_meminfo(&fs::read_to_string("/proc/meminfo").ok()?)
 }
+#[cfg(not(any(windows, target_os = "linux")))]
+fn total_system_memory_mb() -> Option<f64> { None }
 
 /// 汇总本机硬件能力：显卡 / 显存 + 总物理内存（供「适配本机」一键边界计算）。
 #[tauri::command]
 fn hardware_info() -> HardwareInfo {
-    #[cfg(windows)]
     let system_ram_mb = total_system_memory_mb();
-    #[cfg(not(windows))]
-    let system_ram_mb = None;
-
     let info = get_gpu_info();
-    #[cfg(windows)]
     let vram_total_mb = info.supported.then_some(info.vram_total_mb).flatten();
-    #[cfg(not(windows))]
-    let vram_total_mb = None;
     HardwareInfo {
         vendor: info.vendor,
         supported: info.supported,
@@ -1458,6 +1580,21 @@ struct AppUpdateInfo {
     asset_name: Option<String>,
     asset_size: Option<u64>,
     asset_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    install_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    install_supported: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    install_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppInstallResult {
+    status: String,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2175,6 +2312,9 @@ fn get_installed_cuda_version(dir: &Path) -> Option<String> {
 fn find_executable(dir: &Path, exe_name: &str, depth: usize) -> Option<PathBuf> {
     let entries: Vec<_> = fs::read_dir(dir).ok()?.flatten().collect();
     let current = entries.iter().find(|entry| {
+        if !entry.path().is_file() { return false; }
+        #[cfg(target_os = "linux")]
+        if platform::validate_engine(&entry.path()).is_err() { return false; }
         let file_name = entry.file_name();
         let name = file_name.to_string_lossy();
         if cfg!(windows) {
@@ -2211,6 +2351,16 @@ fn find_server_executable(dir: &Path, depth: usize) -> Option<PathBuf> {
     find_server_fuzzy(dir, depth)
 }
 
+fn server_file_is_executable(path: &Path, name: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    { let _ = name; platform::validate_engine(path).is_ok() }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        if cfg!(windows) { name.ends_with(".exe") } else { !name.contains('.') || name.ends_with(".bin") }
+    }
+}
+
 fn find_server_fuzzy(dir: &Path, depth: usize) -> Option<PathBuf> {
     let entries: Vec<_> = fs::read_dir(dir).ok()?.flatten().collect();
     let mut candidate_llama_server = None;
@@ -2220,11 +2370,7 @@ fn find_server_fuzzy(dir: &Path, depth: usize) -> Option<PathBuf> {
         let path = entry.path();
         if path.is_file() {
             let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-            let is_exe = if cfg!(windows) {
-                name.ends_with(".exe")
-            } else {
-                !name.contains('.') || name.ends_with(".bin")
-            };
+            let is_exe = server_file_is_executable(&path, &name);
             if is_exe {
                 // 排除 RPC 节点服务与工具
                 if name.contains("rpc") || name.contains("test") || name.contains("bench") || name.contains("quantize") || name.contains("cli") {
@@ -2282,11 +2428,7 @@ fn collect_server_candidates(root: &Path, dir: &Path, depth: usize, out: &mut Ve
         if path.is_file() {
             let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
             let name_lower = name.to_lowercase();
-            let is_exe = if cfg!(windows) {
-                name_lower.ends_with(".exe")
-            } else {
-                !name_lower.contains('.') || name_lower.ends_with(".bin")
-            };
+            let is_exe = server_file_is_executable(&path, &name_lower);
             if is_exe {
                 // 必须明确排除 RPC 节点服务（如 ggml-rpc-server.exe）、命令行客户端、量化/基准测试等非 LLM API 服务
                 if name_lower.contains("rpc")
@@ -2375,7 +2517,7 @@ fn pick_server_dir(app: AppHandle) -> Result<PickServerResult, String> {
     // 统计有多少种【不同名称】的 Server 程序
     let distinct_names: std::collections::HashSet<_> = candidates
         .iter()
-        .map(|c| c.name.to_lowercase())
+        .map(|c| path_dedupe_key(&c.name))
         .collect();
 
     // 若所有候选文件的程序名称相同（例如只有原版 llama-server.exe，或工程根目录与 build/ 产物重名）：
@@ -2393,7 +2535,7 @@ fn pick_server_dir(app: AppHandle) -> Result<PickServerResult, String> {
         let mut seen = std::collections::HashSet::new();
         let mut unique_candidates = Vec::new();
         for c in candidates {
-            if seen.insert(c.name.to_lowercase()) {
+            if seen.insert(path_dedupe_key(&c.name)) {
                 unique_candidates.push(c);
             }
         }
@@ -2409,17 +2551,17 @@ fn pick_server_dir(app: AppHandle) -> Result<PickServerResult, String> {
 /// 用户取消时返回空串。
 #[tauri::command]
 fn pick_server_file(app: AppHandle) -> Result<String, String> {
-    let mut builder = app.dialog().file();
+    let builder = app.dialog().file();
     #[cfg(windows)]
-    {
-        builder = builder.add_filter("可执行程序 (*.exe)", &["exe"]);
-    }
+    let builder = builder.add_filter("可执行程序 (*.exe)", &["exe"]);
     let Some(file_path) = builder.blocking_pick_file() else {
         return Ok(String::new());
     };
     let Some(path) = file_path.as_path() else {
         return Ok(String::new());
     };
+    #[cfg(target_os = "linux")]
+    platform::validate_engine(path)?;
     Ok(path.to_string_lossy().to_string())
 }
 
@@ -2529,6 +2671,8 @@ fn report_startup_timing(
     guard.react_mounted_ms = Some(react_mounted_ms);
     guard.reported = true;
     log_timing(&guard);
+    #[cfg(target_os = "linux")]
+    linux_app_update::notify_ready()?;
     Ok(())
 }
 
@@ -2721,7 +2865,13 @@ fn set_system_clipboard(text: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn set_system_clipboard(text: &str) -> Result<(), String> {
+    platform::write_clipboard(text, std::env::var_os("PATH").as_deref(),
+        std::env::var_os("WAYLAND_DISPLAY").is_some(), std::env::var_os("DISPLAY").is_some())
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn set_system_clipboard(text: &str) -> Result<(), String> {
     let mut child = std::process::Command::new("pbcopy")
         .stdin(std::process::Stdio::piped())
@@ -2731,7 +2881,9 @@ fn set_system_clipboard(text: &str) -> Result<(), String> {
         use std::io::Write;
         stdin.write_all(text.as_bytes()).map_err(|error| error.to_string())?;
     }
-    child.wait().map_err(|error| error.to_string())?;
+    child.stdin.take();
+    let status = child.wait().map_err(|error| error.to_string())?;
+    if !status.success() { return Err(format!("pbcopy 退出状态：{status}")); }
     Ok(())
 }
 
@@ -2794,7 +2946,7 @@ fn configure_main_window(app: &mut tauri::App) -> tauri::Result<()> {
     window.on_window_event(move |event| {
         if let tauri::WindowEvent::CloseRequested { api, .. } = event {
             let config = read_config(&app_handle).unwrap_or_default();
-            if config.minimize_to_tray_on_close.unwrap_or(true) {
+            if should_hide_on_close(config.minimize_to_tray_on_close, app_handle.tray_by_id("main-tray").is_some()) {
                 api.prevent_close();
                 let _ = win.hide();
             }
@@ -2802,6 +2954,10 @@ fn configure_main_window(app: &mut tauri::App) -> tauri::Result<()> {
     });
 
     Ok(())
+}
+
+fn should_hide_on_close(preference: Option<bool>, tray_available: bool) -> bool {
+    preference.unwrap_or(!cfg!(target_os = "linux")) && tray_available
 }
 
 fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
@@ -3345,6 +3501,7 @@ impl DownloadRegistry {
     /// 校验 controller 仍是该 taskId 当前注册的控制器。
     /// 用于下载循环自检：若自己已被新一轮下载接管（register 覆盖）或被摘除（unregister），
     /// 说明自己已成孤儿循环，应立即退出，否则暂停 / 取消永远送不到它手上。
+    #[cfg(not(target_os = "linux"))]
     fn is_current(&self, task_id: &str, controller: &Arc<DownloadTaskControl>) -> bool {
         self.0.lock().ok()
             .and_then(|guard| guard.get(task_id).map(|slot| Arc::ptr_eq(slot, controller)))
@@ -3427,28 +3584,39 @@ fn hf_clear_download(state: State<DownloadRegistry>, task_id: String) -> Result<
 /// 出于防御只允许删除模型库目录内的目标，拒绝任意路径的删除请求。
 #[tauri::command]
 fn remove_local_file(app: AppHandle, path: String) -> Result<(), String> {
-    let target = PathBuf::from(path.trim());
-    if !target.exists() {
-        return Ok(());
+    if path.is_empty() { return Err("文件路径为空".into()); }
+    #[cfg(target_os = "linux")]
+    {
+        let config = read_config(&app)?;
+        let root = models_root(&app, &config)?;
+        linux_model_download::remove_local_file(&root, Path::new(&path))
     }
-    let config = read_config(&app)?;
-    let root = models_root(&app, &config)?;
-    // 双方都 canonicalize（解析相对段与大小写差异）后再比较前缀，避免绕过
-    let canonical_target = target.canonicalize().map_err(|error| error.to_string())?;
-    let canonical_root = root.canonicalize().unwrap_or(root);
-    if !canonical_target.starts_with(&canonical_root) {
-        return Err(format!("拒绝删除模型库目录之外的路径：{}", path));
-    }
-    if target.is_dir() {
-        fs::remove_dir_all(&target).map_err(|error| format!("删除目录失败：{}", error))
-    } else {
-        fs::remove_file(&target).map_err(|error| format!("删除文件失败：{}", error))
+    #[cfg(not(target_os = "linux"))]
+    {
+        let target = PathBuf::from(path.trim());
+        if !target.exists() { return Ok(()); }
+        let config = read_config(&app)?;
+        let root = models_root(&app, &config)?;
+        let canonical_target = target.canonicalize().map_err(|error| error.to_string())?;
+        let canonical_root = root.canonicalize().unwrap_or(root);
+        if !canonical_target.starts_with(&canonical_root) {
+            return Err(format!("拒绝删除模型库目录之外的路径：{}", path));
+        }
+        if target.is_dir() {
+            fs::remove_dir_all(&target).map_err(|error| format!("删除目录失败：{}", error))
+        } else {
+            fs::remove_file(&target).map_err(|error| format!("删除文件失败：{}", error))
+        }
     }
 }
 
 /// 在系统资源管理器中定位并选中文件（文件不存在时打开其所在目录）。
 #[tauri::command]
 fn reveal_in_folder(path: String) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    { platform::reveal_path(Path::new(&path), std::env::var_os("PATH").as_deref()) }
+    #[cfg(not(target_os = "linux"))]
+    {
     let target = PathBuf::from(path.trim());
     #[cfg(target_os = "windows")]
     {
@@ -3471,13 +3639,19 @@ fn reveal_in_folder(path: String) -> Result<(), String> {
     #[cfg(not(target_os = "windows"))]
     {
         let _ = target;
-        return Err("该功能仅支持 Windows".into());
+        Err("该功能仅支持 Windows 和 Linux".into())
     }
-    Ok(())
+    #[cfg(target_os = "windows")]
+    { Ok(()) }
+    }
 }
+
+#[cfg(target_os = "linux")]
+mod linux_model_download;
 
 /// 下载 HF 文件：多通道自动兜底（配置代理 → 直连 → 本地探测代理 → hf-mirror 镜像）。
 /// 返回 (客户端, 实际 URL, 是否已降级)。
+#[cfg(not(target_os = "linux"))]
 fn download_hf_with_fallback(config_client: &reqwest::blocking::Client, url: &str) -> Result<(reqwest::blocking::Client, String), String> {
     // 只要某通道连接成功（含 4xx 授权类）就返回该通道；由调用者处理状态码
     let attempt = |client: &reqwest::blocking::Client, url: &str| -> Result<(reqwest::blocking::Client, String), String> {
@@ -3494,7 +3668,15 @@ fn download_hf_with_fallback(config_client: &reqwest::blocking::Client, url: &st
         .map_err(|_| "无法访问 HuggingFace（配置代理 / 直连 / 本地代理 / hf-mirror 镜像均失败）".to_string())
 }
 
+#[cfg(not(target_os = "linux"))]
+fn hf_partial_path(dest: &Path) -> PathBuf {
+    let mut name = dest.as_os_str().to_os_string();
+    name.push(".part");
+    PathBuf::from(name)
+}
+
 /// 判断下载 URL 是否属于 HuggingFace（官方站或 hf-mirror 镜像），决定是否附加 Token。
+#[cfg(not(target_os = "linux"))]
 fn is_hf_url(url: &str) -> bool {
     url.starts_with(HF_DL_BASE) || url.contains("hf-mirror.com")
 }
@@ -3671,6 +3853,7 @@ async fn hf_avatar(app: AppHandle, author: String) -> Result<Option<String>, Str
 /// HF / 直链下载共用的传输核心：带鉴权发起请求 → 状态检查（gated 错误协议）→
 /// （可选）Range 断点续传 → 流式落盘（200ms 节流进度 + 速度平滑 + 每任务独立的取消/暂停处理）。
 /// allow_resume：HF 仓库下载启用「文件已存在直接返回」与 Range 续传；直链下载行为保持原样（false）。
+#[cfg(not(target_os = "linux"))]
 #[allow(clippy::too_many_arguments)]
 fn hf_transfer_loop(
     app: &AppHandle,
@@ -3760,7 +3943,7 @@ fn hf_transfer_loop(
         if task.cancel.load(Ordering::Relaxed) {
             drop(file_handle);
             let _ = fs::remove_file(dest);
-            let _ = fs::remove_file(dest.with_extension("part"));
+            let _ = fs::remove_file(hf_partial_path(dest));
             emit_model_progress(app, task_id, repo_label, file_label, "cancelled", 0, 0, 0, 0, "下载已取消");
             return Err("下载已取消".into());
         }
@@ -3769,7 +3952,7 @@ fn hf_transfer_loop(
             task.pause.store(false, Ordering::Relaxed);
             file_handle.flush().ok();
             drop(file_handle);
-            let part = dest.with_extension("part");
+            let part = hf_partial_path(dest);
             let _ = fs::remove_file(&part);
             let _ = fs::rename(dest, &part);
             emit_model_progress(app, task_id, repo_label, file_label, "paused", 0, downloaded, full_total, 0, "已暂停，剩余部分保留在 .part 断点文件");
@@ -3801,8 +3984,38 @@ fn hf_transfer_loop(
     Ok(downloaded)
 }
 
+#[cfg(target_os = "linux")]
+#[tauri::command]
+async fn hf_download(app: AppHandle, state: State<'_, DownloadRegistry>, repo: String, file: String, task_id: String) -> Result<HfDownloadResult, String> {
+    let config = read_config(&app)?;
+    let network = config.network.clone().unwrap_or_default();
+    let token = config.hf_token.clone().unwrap_or_default();
+    let root = models_root(&app, &config)?;
+    let dest = model_download_dest(&root, &repo, &file)?;
+    let url = format!("{}/{}/resolve/main/{}", HF_DL_BASE, hf_repo_id(&repo), file);
+    let registry = state.inner().clone();
+    linux_model_download::run(&app, &registry, &network, &token, &dest, &url, &task_id, &repo, &file).await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+async fn hf_download_url(app: AppHandle, state: State<'_, DownloadRegistry>, url: String, task_id: String) -> Result<HfDownloadResult, String> {
+    let config = read_config(&app)?;
+    let network = config.network.clone().unwrap_or_default();
+    let token = config.hf_token.clone().unwrap_or_default();
+    let root = models_root(&app, &config)?;
+    let raw_name = url.rsplit('/').next().filter(|name| !name.trim().is_empty()).unwrap_or("model.gguf").trim().to_string();
+    let file_name: String = raw_name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect();
+    let file_name = if file_name.to_lowercase().ends_with(".gguf") { file_name } else { format!("{}.gguf", file_name) };
+    let dest = root.join(&file_name);
+    let registry = state.inner().clone();
+    linux_model_download::run(&app, &registry, &network, &token, &dest, &url, &task_id, "direct-url", &file_name).await
+}
+
 /// 下载 HuggingFace 仓库中的指定文件到模型存储目录（流式 + 进度事件 + 断点续传）。
 /// task_id：前端为每次下载生成的唯一标识；取消 / 暂停只作用于该任务自己的控制器。
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 async fn hf_download(app: AppHandle, state: State<'_, DownloadRegistry>, repo: String, file: String, task_id: String) -> Result<HfDownloadResult, String> {
     let config = read_config(&app)?;
@@ -3821,7 +4034,7 @@ async fn hf_download(app: AppHandle, state: State<'_, DownloadRegistry>, repo: S
             fs::create_dir_all(parent).map_err(|error| format!("创建下载目录失败：{}", error))?;
         }
         // 恢复上次暂停留下的 .part 断点文件（暂停时 dest 被改名 dest.part，先改回以便断点续传）
-        let part_path = dest.with_extension("part");
+        let part_path = hf_partial_path(&dest);
         if !dest.exists() && part_path.exists() {
             let _ = fs::rename(&part_path, &dest);
         }
@@ -3844,6 +4057,7 @@ async fn hf_download(app: AppHandle, state: State<'_, DownloadRegistry>, repo: S
 
 /// 从任意直链 URL 下载文件到模型存储目录（流式 + 进度事件）。
 /// task_id：前端生成的唯一任务标识，取消 / 暂停只作用于该任务。
+#[cfg(not(target_os = "linux"))]
 #[tauri::command]
 async fn hf_download_url(app: AppHandle, state: State<'_, DownloadRegistry>, url: String, task_id: String) -> Result<HfDownloadResult, String> {
     let config = read_config(&app)?;
@@ -3865,7 +4079,7 @@ async fn hf_download_url(app: AppHandle, state: State<'_, DownloadRegistry>, url
         let file_name = if file_name.to_lowercase().ends_with(".gguf") { file_name } else { format!("{}.gguf", file_name) };
         let dest = root.join(&file_name);
         // 恢复上次暂停留下的 .part 断点文件
-        let part_path = dest.with_extension("part");
+        let part_path = hf_partial_path(&dest);
         if !dest.exists() && part_path.exists() {
             let _ = fs::rename(&part_path, &dest);
         }
@@ -3884,8 +4098,10 @@ async fn hf_download_url(app: AppHandle, state: State<'_, DownloadRegistry>, url
     result.map_err(|error| format!("下载任务中断：{}", error))?
 }
 
-/// 查询模型存储目录的可用空间（Windows 走 GetDiskFreeSpaceExW；其他平台返回 0）。
-fn free_disk_space(path: &Path) -> (u64, u64) {
+/// 查询模型存储目录空间：Windows GetDiskFreeSpaceExW / Linux statvfs。
+fn free_disk_space(path: &Path) -> Result<(u64, u64), String> {
+    #[cfg(target_os = "linux")]
+    { platform::disk_space(path) }
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -3895,13 +4111,13 @@ fn free_disk_space(path: &Path) -> (u64, u64) {
             let mut free_avail: u64 = 0;
             let mut total: u64 = 0;
             let rc = GetDiskFreeSpaceExW(wide.as_ptr(), &mut free_avail, &mut total, std::ptr::null_mut());
-            if rc == 0 { (0, 0) } else { (total, free_avail) }
+            if rc == 0 { Err(std::io::Error::last_os_error().to_string()) } else { Ok((total, free_avail)) }
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = path;
-        (0, 0)
+        Err("此平台磁盘空间查询尚未开放".into())
     }
 }
 
@@ -3911,7 +4127,7 @@ fn get_models_dir(app: AppHandle) -> Result<DiskUsage, String> {
     let config = read_config(&app)?;
     let root = models_root(&app, &config)?;
     fs::create_dir_all(&root).map_err(|error| error.to_string())?;
-    let (total, free) = free_disk_space(&root);
+    let (total, free) = free_disk_space(&root)?;
     Ok(DiskUsage {
         path: root.to_string_lossy().to_string(),
         total_bytes: total,
@@ -3959,11 +4175,12 @@ fn load_library_exists(dll_name: &str) -> bool {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 fn load_library_exists(_dll_name: &str) -> bool {
     false
 }
 
+#[cfg(not(target_os = "linux"))]
 fn system32_dll_present(name: &str) -> bool {
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
     PathBuf::from(root).join("System32").join(name).exists()
@@ -3971,6 +4188,7 @@ fn system32_dll_present(name: &str) -> bool {
 
 /// 查询 NVIDIA GPU 名称（nvidia-smi 首行），查询失败返回 None。
 fn query_gpu_name() -> Option<String> {
+    let _busy = BusyGuard::acquire(&GPU_QUERY_BUSY)?;
     let path = find_nvidia_smi()?;
     let mut command = Command::new(&path);
     command.args(["--query-gpu=name", "--format=csv,noheader,nounits"]).stdout(Stdio::piped()).stderr(Stdio::null());
@@ -3979,19 +4197,27 @@ fn query_gpu_name() -> Option<String> {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
-    let output = command.output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    let output = gpu_command_output(&mut command)?;
     String::from_utf8(output.stdout).ok()?.lines().map(str::trim).find(|line| !line.is_empty()).map(String::from)
 }
 
 /// 探测运行环境并推荐最合适的 llama.cpp 构建后端：cuda > vulkan > cpu。
 #[tauri::command]
 fn detect_hardware() -> HardwareSuggestion {
-    let nvidia_present = find_nvidia_smi().is_some() || system32_dll_present("nvcuda.dll");
-    let vulkan_present = load_library_exists("vulkan-1.dll") || system32_dll_present("vulkan-1.dll");
-    let gpu_name = if nvidia_present { query_gpu_name() } else { None };
+    #[cfg(target_os = "linux")]
+    let (nvidia_present, vulkan_present, gpu_name) = {
+        let nvidia = query_gpu_name();
+        let vulkan = platform::find_in_path("vulkaninfo", std::env::var_os("PATH").as_deref())
+            .and_then(|path| platform::checked_tool(Command::new(path).arg("--summary"), None, std::time::Duration::from_secs(2)).ok())
+            .and_then(|output| platform::vulkan_device(&String::from_utf8_lossy(&output.stdout)));
+        (nvidia.is_some(), vulkan.is_some(), nvidia.or(vulkan))
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (nvidia_present, vulkan_present, gpu_name) = {
+        let nvidia = find_nvidia_smi().is_some() || system32_dll_present("nvcuda.dll");
+        let vulkan = load_library_exists("vulkan-1.dll") || system32_dll_present("vulkan-1.dll");
+        (nvidia, vulkan, if nvidia { query_gpu_name() } else { None })
+    };
     let recommended_backend = if nvidia_present { "cuda" } else if vulkan_present { "vulkan" } else { "cpu" };
     HardwareSuggestion {
         recommended_backend: recommended_backend.into(),
@@ -4044,6 +4270,12 @@ fn build_net_client(network: &NetworkConfig) -> Result<reqwest::blocking::Client
 
 /// 实际构建逻辑（无缓存）：manual 注入 Proxy::all，system 走系统代理（默认行为），direct 直连并忽略代理。
 fn build_net_client_fresh(network: &NetworkConfig) -> Result<reqwest::blocking::Client, String> {
+    #[cfg(target_os = "linux")]
+    let environment = platform::ProxyEnvironment::read(|key| std::env::var(key).ok());
+    build_net_client_with_environment(network, #[cfg(target_os = "linux")] &environment)
+}
+
+fn build_net_client_with_environment(network: &NetworkConfig, #[cfg(target_os = "linux")] environment: &platform::ProxyEnvironment) -> Result<reqwest::blocking::Client, String> {
     let mut builder = reqwest::blocking::Client::builder()
         .user_agent(HF_UA)
         .connect_timeout(std::time::Duration::from_secs(10));
@@ -4053,10 +4285,15 @@ fn build_net_client_fresh(network: &NetworkConfig) -> Result<reqwest::blocking::
             return Err("手动代理地址为空，请填写 http://127.0.0.1:7890 或 socks5://...".into());
         }
         let proxy = reqwest::Proxy::all(url).map_err(|error| format!("代理地址无效：{}", error))?;
-        builder = builder.proxy(proxy);
+        builder = builder.no_proxy().proxy(proxy);
     } else if network.proxy_mode == "direct" {
         // 直连：显式忽略系统代理 / 手动代理
         builder = builder.no_proxy();
+    } else if network.proxy_mode == "system" {
+        #[cfg(target_os = "linux")]
+        { builder = environment.apply(builder)?; }
+    } else {
+        return Err("未知代理模式".into());
     }
     builder.build().map_err(|error| format!("初始化网络客户端失败：{}", error))
 }
@@ -4107,10 +4344,10 @@ fn get_system_proxy() -> Option<String> {
     {
         read_system_proxy_windows()
     }
-    #[cfg(not(windows))]
-    {
-        None
-    }
+    #[cfg(target_os = "linux")]
+    { platform::ProxyEnvironment::read(|key| std::env::var(key).ok()).display() }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    { None }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4125,9 +4362,13 @@ struct ProxyTestResult {
 /// 测试与 GitHub 的连通性：manual 走自定义代理，system 走系统代理（后台线程执行，避免阻塞 UI）。
 fn test_proxy_connection_impl(network: NetworkConfig) -> Result<ProxyTestResult, String> {
     let client = build_net_client(&network)?;
-    let target = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest".to_string();
+    let target = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest";
+    test_proxy_with_client(&client, target, std::time::Duration::from_secs(25))
+}
+
+fn test_proxy_with_client(client: &reqwest::blocking::Client, target: &str, timeout: std::time::Duration) -> Result<ProxyTestResult, String> {
     let start = now_ms();
-    match client.get(&target).header("accept", "application/vnd.github+json").timeout(std::time::Duration::from_secs(25)).send() {
+    match client.get(target).header("accept", "application/vnd.github+json").timeout(timeout).send() {
         Ok(response) => {
             let code = response.status().as_u16();
             let ok = (200..400).contains(&code);
@@ -4173,6 +4414,8 @@ struct LlamaCppAsset {
     file_name: String,
     url: String,
     size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4422,6 +4665,7 @@ fn is_newer_version(candidate: &str, current: &str) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppInstallKind {
+    #[cfg(windows)]
     Msi,
     Nsis,
 }
@@ -4480,6 +4724,11 @@ fn detect_app_install_kind() -> AppInstallKind {
 }
 
 fn app_installer_from_value(value: &serde_json::Value) -> Option<(String, String, u64, Option<String>)> {
+    if cfg!(target_os = "linux") {
+        #[cfg(target_os = "linux")]
+        return linux_app_update::select(value, linux_app_update::detect().kind).ok()
+            .map(|asset| (asset.url, asset.name, asset.size, Some(asset.digest)));
+    }
     let assets = value.get("assets")?.as_array()?;
     let install_kind = detect_app_install_kind();
 
@@ -4489,6 +4738,7 @@ fn app_installer_from_value(value: &serde_json::Value) -> Option<(String, String
         if lower.contains("arm64") || lower.contains("aarch64") { return None; }
 
         let rank = match install_kind {
+            #[cfg(windows)]
             AppInstallKind::Msi => {
                 if lower.ends_with(".msi") {
                     0 // MSI 用户优先匹配下载 MSI，原地覆盖升级
@@ -4520,12 +4770,32 @@ fn app_installer_from_value(value: &serde_json::Value) -> Option<(String, String
 fn check_app_update_impl(app: &AppHandle) -> Result<AppUpdateInfo, String> {
     let current_version = app.package_info().version.to_string();
     let config = read_config(app)?;
-    let client = build_net_client(&config.network.clone().unwrap_or_default())?;
-    let url = format!("https://api.github.com/repos/{APP_GITHUB_REPO}/releases/latest");
-    let release = fetch_github_release_with_fallback(&client, &url)?;
+    #[cfg(not(target_os = "linux"))]
+    let release = {
+        let client = build_net_client(&config.network.clone().unwrap_or_default())?;
+        let url = format!("https://api.github.com/repos/{APP_GITHUB_REPO}/releases/latest");
+        fetch_github_release_with_fallback(&client, &url)?
+    };
+    #[cfg(target_os = "linux")]
+    let release = linux_app_update::release_metadata(&config.network.clone().unwrap_or_default(), None, || false)?;
     let latest_tag = release.get("tag_name").and_then(serde_json::Value::as_str).unwrap_or("").trim().to_string();
     if latest_tag.is_empty() { return Err("bad-response".into()); }
-    let installer = if cfg!(target_os = "windows") { app_installer_from_value(&release) } else { None };
+    let _installer = if cfg!(target_os = "windows") { app_installer_from_value(&release) } else { None };
+    #[cfg(not(target_os = "linux"))]
+    let installer = _installer;
+    #[cfg(target_os = "linux")]
+    let (installer, install_kind, install_supported, install_reason) = {
+        let context = linux_app_update::detect();
+        match linux_app_update::select(&release, context.kind) {
+            Ok(asset) if linux_app_update::supported(&context) => (
+                Some((asset.url, asset.name, asset.size, Some(asset.digest))),
+                Some(context.kind.name().to_string()), Some(true), Some(context.reason)),
+            Ok(_) => (None, Some("manual".into()), Some(false), Some("当前包已识别，但系统图形安装器或更新辅助工具缺失，请手动更新".into())),
+            Err(reason) => (None, Some("manual".into()), Some(false), Some(if context.kind == linux_app_update::Kind::Manual { context.reason } else { reason })),
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (install_kind, install_supported, install_reason) = (None, None, None);
     let (asset_url, asset_name, asset_size, asset_sha256) = installer
         .map(|(url, name, size, digest)| (Some(url), Some(name), Some(size), digest))
         .unwrap_or((None, None, None, None));
@@ -4535,6 +4805,7 @@ fn check_app_update_impl(app: &AppHandle) -> Result<AppUpdateInfo, String> {
         release_url: release.get("html_url").and_then(serde_json::Value::as_str).unwrap_or("https://github.com/Crvesoft/CookLLM/releases").to_string(),
         release_notes: release.get("body").and_then(serde_json::Value::as_str).map(str::to_string).filter(|text| !text.trim().is_empty()),
         asset_url, asset_name, asset_size, asset_sha256,
+        install_kind, install_supported, install_reason,
     })
 }
 
@@ -4563,7 +4834,16 @@ fn verify_app_installer(path: &Path, expected_size: Option<u64>, expected_digest
     Ok(())
 }
 
+fn automatic_install_gate() -> Result<(), String> {
+    if cfg!(target_os = "linux") { Err("Linux 自动下载与安装尚未开放（阶段 3），请使用已有本地引擎或发布页面".into()) } else { Ok(()) }
+}
+
 fn download_app_update_impl(app: AppHandle, url: String, file_name: String, expected_size: Option<u64>, expected_sha256: Option<String>) -> Result<String, String> {
+    if cfg!(target_os = "linux") {
+        #[cfg(target_os = "linux")]
+        return linux_app_update::download(app, url, file_name);
+    }
+    automatic_install_gate()?;
     let normalized = url.trim().to_string();
     let parsed = reqwest::Url::parse(&normalized).map_err(|_| "安装包下载地址无效".to_string())?;
     if parsed.scheme() != "https" || parsed.host_str() != Some("github.com") || !parsed.path().contains("/releases/download/") {
@@ -4613,7 +4893,12 @@ fn cancel_app_update() -> Result<(), String> {
 }
 
 #[tauri::command]
-fn install_app_update(app: AppHandle, path: String) -> Result<(), String> {
+fn install_app_update(app: AppHandle, path: String) -> Result<Option<AppInstallResult>, String> {
+    if cfg!(target_os = "linux") {
+        #[cfg(target_os = "linux")]
+        return linux_app_update::install(&app, &path);
+    }
+    automatic_install_gate()?;
     let installer = PathBuf::from(&path);
     let allowed_parent = std::env::temp_dir().join("CookLLM");
     if !installer.starts_with(&allowed_parent) || !installer.is_file() || !(path.to_lowercase().ends_with(".exe") || path.to_lowercase().ends_with(".msi")) {
@@ -4623,8 +4908,9 @@ fn install_app_update(app: AppHandle, path: String) -> Result<(), String> {
     // 升级退出前确保杀死当前运行中的 llama-server，防止更新后残留进程占用显存
     let state = app.state::<ProcessState>();
     if let Ok(mut guard) = state.0.lock() {
-        if let Some(mut managed) = guard.take() {
-            kill_managed_child(&mut managed);
+        if let Some(managed) = guard.as_mut() {
+            kill_managed_child(managed)?;
+            *guard = None;
         }
     }
     #[cfg(target_os = "windows")]
@@ -4641,7 +4927,7 @@ fn install_app_update(app: AppHandle, path: String) -> Result<(), String> {
     std::thread::sleep(std::time::Duration::from_millis(400));
     app.cleanup_before_exit();
     app.exit(0);
-    Ok(())
+    Ok(None)
 }
 
 /// 解析 Windows x64 的 llama.cpp 资产（llama-bXXXX-bin-win-{cuda|vulkan|avx2}.zip）。
@@ -4668,7 +4954,7 @@ fn parse_win_assets(value: &serde_json::Value) -> Vec<LlamaCppAsset> {
         let backend = if lower.contains("win-cuda") { "cuda" } else if lower.contains("win-vulkan") { "vulkan" } else if lower.contains("win-cpu") || lower.contains("win-avx2") { "cpu" } else { continue };
         let cuda_full_version = if backend == "cuda" { extract_cuda_full_version(&lower) } else { String::new() };
         let cuda_version = if backend == "cuda" { extract_cuda_major_version(&cuda_full_version) } else { String::new() };
-        out.push(LlamaCppAsset { backend: backend.into(), cuda_version, cuda_full_version, file_name: name.to_string(), url, size });
+        out.push(LlamaCppAsset { backend: backend.into(), cuda_version, cuda_full_version, file_name: name.to_string(), url, size, sha256: None });
     }
     out
 }
@@ -4695,7 +4981,7 @@ fn parse_cudart_assets(value: &serde_json::Value) -> Vec<LlamaCppAsset> {
         let size = item.get("size").and_then(|value| value.as_u64()).unwrap_or(0);
         let cuda_full_version = extract_cuda_full_version(&lower);
         let cuda_version = extract_cuda_major_version(&cuda_full_version);
-        out.push(LlamaCppAsset { backend: "cuda".into(), cuda_version, cuda_full_version, file_name: name.to_string(), url, size });
+        out.push(LlamaCppAsset { backend: "cuda".into(), cuda_version, cuda_full_version, file_name: name.to_string(), url, size, sha256: None });
     }
     out
 }
@@ -4774,6 +5060,11 @@ fn pick_asset<'a>(assets: &'a [LlamaCppAsset], backend: &'a str, cuda_version: &
 
 /// 检查远程最新版本并匹配当前硬件后端对应的 Windows 资产（内部阻塞实现）。
 fn check_llamacpp_update_impl(app: &AppHandle, backend: Option<String>, cuda_version: Option<String>) -> Result<LlamaCppRelease, String> {
+    if cfg!(target_os = "linux") {
+        #[cfg(target_os = "linux")]
+        return linux_engine_update::check_update(app, backend, cuda_version);
+    }
+    automatic_install_gate()?;
     let config = read_config(app)?;
     let network = config.network.clone().unwrap_or_default();
     let client = build_net_client(&network)?;
@@ -4799,6 +5090,8 @@ async fn check_llamacpp_update(app: AppHandle, backend: Option<String>, cuda_ver
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DownloadProgress {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<&'static str>,
     phase: String,
     percent: u32,
     downloaded: u64,
@@ -4809,6 +5102,7 @@ struct DownloadProgress {
 
 fn emit_download_progress(app: &AppHandle, phase: &str, percent: u32, downloaded: u64, total: u64, speed_bps: u64, message: impl Into<String>) {
     let _ = app.emit("download-progress", DownloadProgress {
+        source: if cfg!(target_os = "linux") { Some("engine") } else { None },
         phase: phase.into(),
         percent: percent.min(100),
         downloaded,
@@ -5016,6 +5310,11 @@ fn cancel_llamacpp_update() -> Result<(), String> {
 
 /// 一键更新 / 重新安装 llama.cpp（内部阻塞实现）。
 fn download_llamacpp_impl(app: AppHandle, backend: String, cuda_version: Option<String>, asset_url: Option<String>, asset_name: Option<String>, tag: Option<String>) -> Result<String, String> {
+    if cfg!(target_os = "linux") {
+        #[cfg(target_os = "linux")]
+        return linux_engine_update::download(app, backend, cuda_version, asset_url, asset_name, tag);
+    }
+    automatic_install_gate()?;
     // 引擎更新链路：RAII 守卫负责在任何退出路径复位取消标志（只影响本链路，不波及应用自更新）
     let cancel = CancelFlag(&LLAMACPP_UPDATE_CANCEL);
     let _guard = CancelGuard(cancel);
@@ -5024,7 +5323,7 @@ fn download_llamacpp_impl(app: AppHandle, backend: String, cuda_version: Option<
         let state = app.state::<ProcessState>();
         let mut guard = state.0.lock().map_err(|_| "进程状态锁已损坏".to_string())?;
         if let Some(managed) = guard.as_mut() {
-            let still_running = managed.child.try_wait().map(|wait| wait.is_none()).unwrap_or(true);
+            let still_running = !managed_child_exited(managed).unwrap_or(false);
             if still_running {
                 return Err("llama-server 正在运行，请先在顶部停止服务后再更新引擎".into());
             }
@@ -5211,70 +5510,83 @@ mod tests {
     use super::find_executable;
     use std::fs;
 
+    fn fixture_name(stem: &str) -> String {
+        if cfg!(windows) { format!("{stem}.exe") } else { stem.to_string() }
+    }
+
+    fn write_engine(path: &std::path::Path) {
+        fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    fn fixture_dir(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("cookllm_{}_{}", std::process::id(), label));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
     fn make_tree(base: &std::path::Path) {
         fs::create_dir_all(base.join("build").join("bin")).unwrap();
-        fs::write(base.join("build").join("bin").join("llama-server.exe"), "dummy").unwrap();
+        write_engine(&base.join("build").join("bin").join(fixture_name("llama-server")));
         fs::create_dir_all(base.join("empty")).unwrap();
     }
 
     #[test]
     fn find_executable_recurses_subdirectories() {
-        let base = std::env::temp_dir().join("cookllm_find_test");
-        let _ = fs::remove_dir_all(&base);
+        let base = fixture_dir("find_recursive");
         make_tree(&base);
-        let found = find_executable(&base, "llama-server.exe", 0).expect("should find exe");
-        assert!(found == base.join("build").join("bin").join("llama-server.exe"), "found: {found:?}");
-        let _ = fs::remove_dir_all(&base);
+        let name = fixture_name("llama-server");
+        let found = find_executable(&base, &name, 0).expect("should find exe");
+        assert_eq!(found, base.join("build").join("bin").join(name));
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
     fn find_executable_prefers_current_directory() {
-        let base = std::env::temp_dir().join("cookllm_find_test_current");
-        let _ = fs::remove_dir_all(&base);
+        let base = fixture_dir("find_current");
         make_tree(&base);
-        fs::write(base.join("llama-server.exe"), "dummy-current").unwrap();
-        let found = find_executable(&base, "llama-server.exe", 0).expect("should find exe");
-        assert!(found == base.join("llama-server.exe"), "found: {found:?}");
-        let _ = fs::remove_dir_all(&base);
+        let name = fixture_name("llama-server");
+        write_engine(&base.join(&name));
+        let found = find_executable(&base, &name, 0).expect("should find exe");
+        assert_eq!(found, base.join(name));
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
     fn find_executable_returns_none_when_missing() {
-        let base = std::env::temp_dir().join("cookllm_find_test_none");
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).unwrap();
-        assert!(find_executable(&base, "llama-server.exe", 0).is_none());
-        let _ = fs::remove_dir_all(&base);
+        let base = fixture_dir("find_missing");
+        assert!(find_executable(&base, &fixture_name("llama-server"), 0).is_none());
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
     fn find_server_executable_finds_branch_server() {
         use super::find_server_executable;
-        let base = std::env::temp_dir().join("cookllm_find_test_branch");
-        let _ = fs::remove_dir_all(&base);
+        let base = fixture_dir("find_branch");
         fs::create_dir_all(base.join("bin")).unwrap();
-        fs::write(base.join("bin").join("llama-kvmem-server.exe"), "dummy-kvmem").unwrap();
+        let name = fixture_name("llama-kvmem-server");
+        write_engine(&base.join("bin").join(&name));
         let found = find_server_executable(&base, 0).expect("should find custom branch server");
-        assert!(found == base.join("bin").join("llama-kvmem-server.exe"), "found: {found:?}");
-        let _ = fs::remove_dir_all(&base);
+        assert_eq!(found, base.join("bin").join(name));
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
     fn collect_server_candidates_filters_rpc_server() {
         use super::collect_server_candidates;
-        let base = std::env::temp_dir().join("cookllm_collect_test_rpc");
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).unwrap();
-        // 模拟官方包：同时存在 llama-server.exe 与 ggml-rpc-server.exe
-        fs::write(base.join("llama-server.exe"), "dummy-server").unwrap();
-        fs::write(base.join("ggml-rpc-server.exe"), "dummy-rpc").unwrap();
-        fs::write(base.join("llama-cli.exe"), "dummy-cli").unwrap();
-
+        let base = fixture_dir("collect_rpc");
+        for stem in ["llama-server", "ggml-rpc-server", "llama-cli"] {
+            write_engine(&base.join(fixture_name(stem)));
+        }
         let mut candidates = Vec::new();
         collect_server_candidates(&base, &base, 0, &mut candidates);
         assert_eq!(candidates.len(), 1, "RPC 和 CLI 必须被排除，仅保留标准 server");
-        assert_eq!(candidates[0].name, "llama-server.exe");
-        let _ = fs::remove_dir_all(&base);
+        assert_eq!(candidates[0].name, fixture_name("llama-server"));
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
@@ -5321,7 +5633,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![hf_trending, hf_search, hf_list_files, hf_whoami, hf_avatar, hf_download, hf_download_url, hf_cancel_download, hf_pause_download, hf_clear_download, remove_local_file, reveal_in_folder, get_models_dir, pick_models_dir, load_config, save_config, start_server, stop_server, get_server_status, check_orphan_server, kill_orphan_server, get_gpu_stats, get_gpu_info, hardware_info, detect_hardware, test_proxy_connection, get_system_proxy, get_llamacpp_status, check_llamacpp_update, download_llamacpp, cancel_llamacpp_update, check_app_update, download_app_update, cancel_app_update, install_app_update, pick_files, pick_folder, pick_server_dir, pick_server_file, expand_paths, inspect_gguf, paths_exist, export_config_backup, pick_config_backup, open_url, open_config_dir, clipboard_write, set_window_theme, show_main_window, report_startup_timing])
         .setup(|app| {
             configure_main_window(app)?;
-            setup_tray(app)?;
+            if let Err(error) = setup_tray(app) {
+                eprintln!("托盘创建失败，保留主窗口：{error}");
+                if let Some(window) = app.get_webview_window("main") { window.show()?; }
+            }
             Ok(())
         });
 
@@ -5361,12 +5676,16 @@ pub fn run() {
                 }
             }
             tauri::RunEvent::ExitRequested { .. } => {
-                // 关闭窗口（X 按钮）退出时，同样用 taskkill /T /F 杀掉 llama-server，
-                // 保证"关软件 = 关服务"，避免它留在后台继续占显存。
+                // 等待正在进行的启停完成，再清理托管组，避免退出与重启交错。
+                let _lifecycle = PROCESS_LIFECYCLE_LOCK.lock();
                 let state = app_handle.state::<ProcessState>();
                 if let Ok(mut guard) = state.0.lock() {
-                    if let Some(mut managed) = guard.take() {
-                        kill_managed_child(&mut managed);
+                    if let Some(managed) = guard.as_mut() {
+                        if let Err(error) = kill_managed_child(managed) {
+                            eprintln!("引擎退出清理失败：{error}");
+                        } else {
+                            *guard = None;
+                        }
                     }
                 };
             }

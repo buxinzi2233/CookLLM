@@ -163,11 +163,14 @@ export function LogsPage({
   const { t } = useI18n();
   const endRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState(false);
 
   const handleCopyLogs = async () => {
     if (!logs.length) return;
     const text = formatLogsPlainText(logs);
+    setCopyError(false);
     const ok = await copyTextToClipboard(text);
+    setCopyError(!ok);
     if (ok) {
       setCopied(true);
       setTimeout(() => setCopied(false), 1800);
@@ -207,6 +210,7 @@ export function LogsPage({
 
   return (
     <div className="logs-page">
+      {copyError && <p className="import-error" role="alert">{t("logs.copyFailed")}</p>}
       <div className="console-toolbar">
         <div className="dock-tabs" role="tablist">
           <button type="button" role="tab" aria-selected={tab === "logs"} className={cn("dock-tab", tab === "logs" && "active")} onClick={() => setTab("logs")}>

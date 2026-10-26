@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { Cpu, FolderOpen, FileCode, Save, X, Loader2, Check, AlertTriangle, Sparkles } from "lucide-react";
 import { useI18n } from "../i18n";
+import { canAutoInstallEngine, defaultEngineBackend, engineInputPath, enginePathPlaceholder, getPlatform, pathIdentity } from "../platform";
 import { uid } from "../data";
 import { getLlamaCppStatus, pickServerDir, pickServerFile, type LlamaCppLocalStatus, type ServerCandidate } from "../tauri";
 import type { LlamaEngine } from "../types";
@@ -15,8 +16,8 @@ interface Props {
 
 /** 从完整路径与程序名推导友好的默认分支名称 */
 function inferBranchName(filePath: string, fileName?: string): string {
-  if (!filePath.trim()) return "";
-  const normalized = filePath.replace(/\\/g, "/");
+  if (!engineInputPath(filePath)) return "";
+  const normalized = getPlatform() === "windows" ? filePath.replace(/\\/g, "/") : filePath;
   const parts = normalized.split("/").filter(Boolean);
   const rawExe = (fileName || parts[parts.length - 1] || "").replace(/\.exe$/i, "");
 
@@ -55,7 +56,7 @@ export default function EngineModal({ engine, isDefault = false, onSave, onClose
 
   const [name, setName] = useState(engine?.name ?? "");
   const [path, setPath] = useState(engine?.path ?? "");
-  const [backend, setBackend] = useState<string>(engine?.backend ?? "cuda");
+  const [backend, setBackend] = useState<string>(engine?.backend ?? defaultEngineBackend());
   const [cudaVersion, setCudaVersion] = useState<string>(engine?.cudaVersion ?? "");
   const [version, setVersion] = useState<string>(engine?.version ?? "");
   const [engineType, setEngineType] = useState<EngineTypeKey>(
@@ -79,21 +80,21 @@ export default function EngineModal({ engine, isDefault = false, onSave, onClose
   }, [onClose]);
 
   const probePath = async (targetPath: string) => {
-    if (!targetPath.trim()) {
+    if (!engineInputPath(targetPath)) {
       setDetectionStatus(null);
       return;
     }
     setDetecting(true);
     setError(null);
     try {
-      const status = await getLlamaCppStatus(targetPath.trim());
+      const status = await getLlamaCppStatus(engineInputPath(targetPath));
       setDetectionStatus(status);
       if (status) {
         if (status.localBackend) setBackend(status.localBackend);
         if (status.cudaVersion) setCudaVersion(status.cudaVersion);
         if (status.localVersion) setVersion(status.localVersion);
         if (status.engineType) setEngineType(status.engineType as EngineTypeKey);
-        if (status.serverPath && status.serverPath !== targetPath) {
+        if (status.serverPath && pathIdentity(status.serverPath) !== pathIdentity(targetPath)) {
           setPath(status.serverPath);
         }
       }
@@ -112,8 +113,8 @@ export default function EngineModal({ engine, isDefault = false, onSave, onClose
 
   const handlePathChange = (val: string) => {
     setPath(val);
-    if (val.trim()) {
-      setEngineType(detectEngineType(val.trim()));
+    if (engineInputPath(val)) {
+      setEngineType(detectEngineType(engineInputPath(val)));
     }
     if (!name.trim()) {
       setName(inferBranchName(val));
@@ -139,7 +140,7 @@ export default function EngineModal({ engine, isDefault = false, onSave, onClose
       } else if (result.status === "multiple") {
         setCandidateList(result.candidates);
         // 若有多个候选，默认选中第一项并就近探测，同时展示候选列表供用户点选切换
-        const match = result.candidates.find((c) => c.path.toLowerCase() === path.toLowerCase()) || result.candidates[0];
+        const match = result.candidates.find((c) => pathIdentity(c.path) === pathIdentity(engineInputPath(path))) || result.candidates[0];
         if (match) {
           setPath(match.path);
           setEngineType(detectEngineType(match.path));
@@ -194,7 +195,7 @@ export default function EngineModal({ engine, isDefault = false, onSave, onClose
   };
 
   const handleSave = () => {
-    const trimmedPath = path.trim();
+    const trimmedPath = engineInputPath(path);
     if (!trimmedPath) {
       setError(t("llama.branchPathPlaceholder"));
       return;
@@ -204,8 +205,8 @@ export default function EngineModal({ engine, isDefault = false, onSave, onClose
       id: engine?.id || uid("engine"),
       name: finalName,
       path: trimmedPath,
-      backend: backend || "cuda",
-      cudaVersion: (backend || "cuda") === "cuda" ? (cudaVersion || detectionStatus?.cudaVersion || engine?.cudaVersion) : undefined,
+      backend: backend || defaultEngineBackend(),
+      cudaVersion: (backend || defaultEngineBackend()) === "cuda" ? (cudaVersion || detectionStatus?.cudaVersion || engine?.cudaVersion) : undefined,
       version: version || undefined,
       createdAt: engine?.createdAt || Date.now(),
       engineType: engineType,
@@ -227,6 +228,7 @@ export default function EngineModal({ engine, isDefault = false, onSave, onClose
         </header>
 
         <div className="confirm-modal-body" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          {!canAutoInstallEngine() && <p className="about-desc">{t("linux.manualEngine")}</p>}
           {/* 分支名称 */}
           <div className="engine-modal-field">
             <label>{t("llama.branchName")}</label>
@@ -269,7 +271,7 @@ export default function EngineModal({ engine, isDefault = false, onSave, onClose
                 style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 12 }}
                 value={path}
                 onChange={(e) => handlePathChange(e.target.value)}
-                placeholder={t("llama.branchPathPlaceholder")}
+                placeholder={enginePathPlaceholder()}
               />
               {detecting && <Loader2 size={16} className="spin" style={{ flex: "none" }} />}
             </div>
@@ -292,7 +294,7 @@ export default function EngineModal({ engine, isDefault = false, onSave, onClose
               </div>
               <div className="engine-candidate-items">
                 {candidateList.map((c) => {
-                  const isSelected = path.trim().toLowerCase() === c.path.toLowerCase();
+                  const isSelected = pathIdentity(engineInputPath(path)) === pathIdentity(c.path);
                   const showRelPath = Boolean(c.relPath && c.relPath.toLowerCase() !== c.name.toLowerCase());
                   return (
                     <button
@@ -327,7 +329,7 @@ export default function EngineModal({ engine, isDefault = false, onSave, onClose
           )}
 
           {/* 环境探测卡片 */}
-          {path.trim() && (
+          {engineInputPath(path) && (
             <div className="engine-detection-card">
               <div className="engine-det-head">
                 <Sparkles size={14} className="engine-hub-header-icon" />
@@ -409,7 +411,7 @@ export default function EngineModal({ engine, isDefault = false, onSave, onClose
           <button className="secondary-button" onClick={onClose}>
             {t("cancel")}
           </button>
-          <button className="primary-button" onClick={handleSave} disabled={!path.trim()}>
+          <button className="primary-button" onClick={handleSave} disabled={!engineInputPath(path)}>
             <Save size={15} />
             {t("confirm")}
           </button>

@@ -1,0 +1,81 @@
+name: Linux check
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/linux-check.yml'
+      - '.github/workflows/release.yml'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'scripts/**'
+      - 'src/**'
+      - 'src-tauri/**'
+      - 'public/**'
+      - 'index.html'
+      - 'tsconfig*.json'
+      - 'vite.config.*'
+  push:
+    branches: ['**']
+    paths:
+      - '.github/workflows/linux-check.yml'
+      - '.github/workflows/release.yml'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'scripts/**'
+      - 'src/**'
+      - 'src-tauri/**'
+      - 'public/**'
+      - 'index.html'
+      - 'tsconfig*.json'
+      - 'vite.config.*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-check-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      NO_STRIP: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl wget file pkg-config libssl-dev libgtk-3-dev \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            patchelf rpm libfuse2
+      - name: Install npm dependencies
+        run: npm ci
+      - name: Check Rust (locked)
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml
+      - name: Test Rust (locked)
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Test Linux frontend contracts
+        run: |
+          node scripts/test-linux-paths.mjs
+          node scripts/test-linux-ui.mjs
+      # Headless build/test is not a desktop, GPU or real-model smoke test.
+      - name: Build Linux packages
+        run: npm run build:linux -- --ci
+      - name: Upload Linux packages (no release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-check-x86_64
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/rpm/*.rpm
+            src-tauri/target/release/bundle/appimage/*.AppImage
