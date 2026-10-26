@@ -4,6 +4,7 @@ import { APP_VERSION } from "../data";
 import { useI18n } from "../i18n";
 import { openExternal, cancelAppUpdate, downloadAppUpdate, installAppUpdate, onDownloadProgress, type DownloadProgress, type UpdateCheckResult } from "../tauri";
 import { formatBytes, formatMB } from "../utils";
+import ChangelogViewer from "./ChangelogViewer";
 
 import { acceptsDownloadProgress, canAutoInstallApp, getPlatform, installerPackageType } from "../platform";
 
@@ -251,7 +252,7 @@ function AppUpdateSession({ update, onClose }: { update: UpdateCheckResult; onCl
                 <strong>{t("update.changelog")}</strong>
               </div>
               <div className="update-changelog-content">
-                <pre>{update.releaseNotes?.trim() || t("update.noChangelog")}</pre>
+                <ChangelogViewer content={update.releaseNotes?.trim() || t("update.noChangelog")} />
               </div>
             </div>
           </div>

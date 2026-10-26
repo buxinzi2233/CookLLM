@@ -2,7 +2,7 @@
 
 ## 1. `docs/` 目录定位与提交规则（最高准则）
 
-- **定位**：`docs/` 目录仅用于存放 `README.md` 中引用的演示截图及维护者文档（如 `发布指引.md`），不参与 Tauri 应用打包与源码构建。
+- **定位**：`docs/` 目录仅用于存放 `README.md` 中引用的演示截图及维护者文档（如 `发布指引.md`、`开发规范.md`），不参与 Tauri 应用打包与源码构建。
 - **仅 `docs/` 变动时的处理规范**：
   - 当项目内**仅有 `docs/` 目录下的文件存在修改**（如用户更新了截图图片、修改了文档）时：
     1. **提交与推送须明确授权**：普通“更新文档”只授权编辑；“提交”与“推送”分别确认，只有用户明确授权两者后才执行 `git add docs/`、`git commit -m "docs: ..."` 并 `git push origin master`，且仅包含本次授权文件；
@@ -27,7 +27,12 @@
 - 定向测试用于开发中快速定位，并不替代上述完整打包要求；涉及 IPC、配置迁移、下载或进程生命周期时，还需核对相应失败路径与关键交互。
 - 若受平台或依赖条件阻碍，记录实际命令、失败原因和未完成项，明确“实现已完成，验证未完成”；不要把静态检查或 Windows CI 当作 Linux 打包通过的证据。
 
-## 4. 架构入口与改动边界
+## 4. 功能开发规范
+
+- 新增或修改功能前，必须阅读并遵循 `docs/开发规范.md`：按领域定位改动落点（前端 hooks / components / styles / tauri.ts，后端对应 `*.rs` 模块），保持配置与历史数据兼容，并通过其中的验证门禁。
+- 不得借功能开发之机进行无关重构、引入新依赖或改动版本号/更新日志；提交与发版仍需用户明确指令。
+
+## 5. 架构入口与改动边界
 
 - CookLLM 是本地推理引擎/模型桌面管理器，技术栈为 **Tauri 2 / Rust + React 19 / TypeScript / Vite 6**；前端使用 npm 与 `package-lock.json`。
 - `src/App.tsx`：页面编排、配置状态、服务/下载交互；`src/components/`：各页面与弹窗。
@@ -45,7 +50,7 @@
 - 用户配置由 Tauri `app_config_dir()` 下的 `config.json` 保存；模型默认在 `app_data_dir()/models`，也可使用用户自定义目录；引擎目录由配置或 `app_data_dir()/llamacpp` 决定。这些是**平台用户目录，不是源码目录**；不要读取/清理真实配置、Token、模型缓存或用户模型来完成文档维护，验证使用独立 fixture。
 - `src-tauri/gen/schemas/` 是生成产物，不手工修改；权限/配置从对应源文件调整后由工具生成。
 
-## 5. 真实命令与定向验证
+## 6. 真实命令与定向验证
 
 以下命令从仓库根目录执行，依据 `package.json`、Cargo 配置及源码核对；命令表本身不代表每条均已运行，实际证据与未验范围见 Linux 计划：
 
@@ -74,9 +79,9 @@
 | Linux 完整本地打包 | `npm run build:linux -- --ci`：调用本地 Tauri build，默认仅对子进程设置 `NO_STRIP=1`，保留用户覆盖；包含前端 beforeBuildCommand，仍遵循第 3 节完整打包门槛 |
 
 - 当前未定义 `npm test`、`npm run lint` 脚本，不虚构这些验收命令。
-- Rust 原有 `gguf_meta_tests`、`tests` 模块继续保留；Linux 新增测试入口见第 4 节。平台模拟、SSR、假 server 与真实上游包版本查询各有边界，均不替代 Windows 实机、真实模型或完整 GUI 验收；报告 ignored 的原因与单独执行证据，不以跳过冒充通过。
+- Rust 原有 `gguf_meta_tests`、`tests` 模块继续保留；Linux 新增测试入口见第 5 节。平台模拟、SSR、假 server 与真实上游包版本查询各有边界，均不替代 Windows 实机、真实模型或完整 GUI 验收；报告 ignored 的原因与单独执行证据，不以跳过冒充通过。
 
-## 6. Linux 现状与后续计划
+## 7. Linux 现状与后续计划
 
 - Linux x86_64 路径/进程/硬件/桌面/代理、CPU/Vulkan/CUDA 自动引擎与异步模型下载已实现。CUDA 官方双包私有 runtime 仅作用于托管 CUDA 子进程；用户偏好与实际 full 版本分离。应用按 Context 分派：AppImage 原子替换/备份与 React 确认回退，deb/rpm 仅图形安装器交接，未知布局/缺工具/digest 为 manual；Windows 保留原流程、未实机。
 - 本机核心施工基本完成：第四轮主仓库编译、Rust 库测试与三包构建通过；前端路径/UI、官方 CUDA 12.8 双包、本地下载 IPC 与独立 Wayland 交互沿用第三轮证据，本轮未重跑 Node tests。新增本地模拟发布下真实旧/新 GUI 跨版本升级、Thunar 定位与原生 tray DBus 协议通过；GTK 菜单渲染为部分验证。AppImage exact APPDIR 修复保留唯一只读挂载/UID/source/fstype 与 runtime 设备/inode/open FD 核验，不以环境变量证明运行身份。

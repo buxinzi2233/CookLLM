@@ -1,6 +1,6 @@
 [package]
 name = "cookllm"
-version = "0.3.2"
+version = "0.4.1"
 description = "A lightweight desktop launcher for local llama.cpp models"
 authors = ["CookLLM"]
 edition = "2021"
@@ -23,6 +23,7 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 sha2 = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tauri-plugin-single-instance = "2.4.4"
+tauri-plugin-global-shortcut = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

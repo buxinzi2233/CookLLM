@@ -10,3 +10,4 @@ src-tauri/target/
 .tmp/
 .snow/
 __pycache__/
+.test-dist/

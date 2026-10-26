@@ -1,5 +1,17 @@
 export type Page = "models" | "explore" | "playground" | "profiles" | "settings" | "logs";
 
+/** 界面主题 */
+export type Theme = "dark" | "light";
+
+/** 引擎架构类型：llamacpp | ninfer | ninfer_kvmem */
+export type EngineType = "llamacpp" | "ninfer" | "ninfer_kvmem";
+
+/** llama.cpp 计算后端 */
+export type LlamaBackend = "cuda" | "vulkan" | "cpu";
+
+/** 网络代理模式 */
+export type ProxyMode = "system" | "manual" | "direct";
+
 /** 各页面的日志显示方式：dock=参与页面布局的底部 Dock（除日志页外所有页面），page=整页视图 */
 export type LogMode = "dock" | "page";
 
@@ -71,7 +83,7 @@ export interface Profile {
   /** 该预设关联的 llama.cpp / ninfer 引擎分支 ID；未指定或为空则跟随全局默认引擎 */
   engineId?: string;
 
-  /** ninfer / ninfer-kvmem 专属：KV 缓存量化类型（如 rk8v4 / int8 / bf16 / nvfp4） */
+  /** ninfer / ninfer-kvmem 专属：KV 缓存量化格式（bf16 / int8 / fp8 / rk8v4 / rk4v4 / rk4v4-e8 / rk2v4-e8 / nvfp4 / k8v4） */
   kvDtype?: string;
   /** ninfer 专属：预填充分块 Token 数（128 的倍数，如 256 / 512） */
   prefillChunk?: number;
@@ -115,6 +127,28 @@ export interface Profile {
   seed?: number;
   /** ninfer 专属：CUDA Graph 驱动状态预留显存（--cuda-graph-allowance-mib MiB） */
   cudaGraphAllowanceMib?: number;
+  /** ninfer 专属：启用图片与视频输入（--vision） */
+  vision?: boolean;
+  /** ninfer 专属：快捷开启 CPU 视觉（--vision-cpu） */
+  visionCpu?: boolean;
+  /** ninfer 专属：视觉组件放置位置（--vision-residency，如 resident / overlay） */
+  visionResidency?: string;
+  /** ninfer 专属：每项媒体的视觉 token 上限（--vision-max-merged N，默认 16384；CPU 视觉建议 256） */
+  visionMaxMerged?: number;
+  /** ninfer 专属：已处理媒体缓存 MiB（--media-cache-mib MiB，默认 1024） */
+  mediaCacheMib?: number;
+  /** ninfer 专属：活跃媒体总预算 MiB（--media-live-mib MiB，默认 2048） */
+  mediaLiveMib?: number;
+  /** ninfer 专属：媒体预处理线程数（--media-preprocess-threads N，默认 0 自动） */
+  mediaPreprocessThreads?: number;
+  /** ninfer 专属：GDN 循环状态采用 FP16（--gdn-state-fp16），减半宿主状态镜像显存并减少 Decode 内存带宽 */
+  gdnStateFp16?: boolean;
+  /** ninfer 专属：混合前缀缓存优化（--use-alt-prefix-caching） */
+  useAltPrefixCaching?: boolean;
+  /** ninfer 专属：GPU 状态快照槽位（--device-snapshot-slots N，未填写时按并发数与缓存情况自动分配） */
+  deviceSnapshotSlots?: number;
+  /** ninfer 专属：保留历史思考（--preserve-thinking），在后续多轮对话中保留助手的思考过程 */
+  preserveThinking?: boolean;
 }
 
 /** 托管的 llama.cpp / ninfer 引擎分支版本 */
@@ -122,12 +156,12 @@ export interface LlamaEngine {
   id: string;
   name: string;
   path: string;
-  backend?: "cuda" | "vulkan" | "cpu" | string;
+  backend?: LlamaBackend | string;
   cudaVersion?: string;
   version?: string;
   createdAt?: number;
   /** 引擎架构类型：llamacpp | ninfer | ninfer_kvmem */
-  engineType?: "llamacpp" | "ninfer" | "ninfer_kvmem";
+  engineType?: EngineType;
 }
 
 export interface AppConfig {
@@ -139,7 +173,7 @@ export interface AppConfig {
   models: ModelAsset[];
   /** 旧版全局预设池，仅兼容旧配置读取；新配置预设已归入每个模型的 ModelAsset.profiles */
   profiles?: Profile[];
-  theme?: "dark" | "light";
+  theme?: Theme;
   /** 全局标签库池（用户自定义维护的标签列表） */
   customTags?: string[];
   /** 界面语言：zh（默认）/ en，设置页可切换并持久化 */
@@ -156,21 +190,38 @@ export interface AppConfig {
   preferredProfileId?: string;
   /** 网络与代理配置（跟随系统 / 手动 HTTP/SOCKS5 代理 / GitHub 反代镜像） */
   network?: {
-    proxyMode: "system" | "manual" | "direct";
+    proxyMode: ProxyMode;
     proxyUrl?: string;
   };
   /** 自定义 llama.cpp 安装目录（缺省为应用数据目录下的 llamacpp） */
   llamacppDir?: string;
   /** 模型存储根目录（社区下载 / 自动扫描，缺省为应用数据目录下的 models） */
   modelsDir?: string;
-  /** 启动时自动检测应用更新（默认开启） */
+  /** 自动检测应用更新（启动后每 30 分钟，默认开启） */
   autoUpdateEnabled?: boolean;
   /** 关闭主窗口时是否最小化到托盘（默认开启） */
   minimizeToTrayOnClose?: boolean;
   /** llama.cpp 选定的硬件加速后端（cuda / vulkan / cpu） */
-  llamaBackend?: "cuda" | "vulkan" | "cpu";
+  llamaBackend?: LlamaBackend;
   /** llama.cpp 选定的 CUDA 版本偏好（如 "13"、"13.4"、"12" 等） */
   llamaCudaVersion?: string;
+  /** 全局快捷键自定义配置 */
+  shortcuts?: ShortcutsConfig;
+}
+
+export type ShortcutActionKey = "toggleWindow" | "startServer" | "stopServer" | "switchEngine";
+
+export interface ShortcutsConfig {
+  /** 全局快捷键总开关（默认关闭） */
+  enabled?: boolean;
+  /** 后台打开主界面快捷键，如 "Alt+Shift+C" */
+  toggleWindow?: string;
+  /** 开启服务快捷键，如 "Alt+Shift+S" */
+  startServer?: string;
+  /** 关闭服务快捷键，如 "Alt+Shift+X" */
+  stopServer?: string;
+  /** 切换引擎快捷键，如 "Alt+Shift+E" */
+  switchEngine?: string;
 }
 
 export interface ServerStatus {
@@ -187,7 +238,7 @@ export interface ServerStatus {
   /** 启动当前服务所用的引擎计算后端 */
   engineBackend?: string;
   /** 启动当前服务所用的引擎架构类型 */
-  engineType?: "llamacpp" | "ninfer" | "ninfer_kvmem";
+  engineType?: EngineType;
 }
 
 /** GPU 实时指标（nvidia-smi 轮询，单位 MiB / % / W）；无 NVIDIA 驱动或字段不支持时为 null/缺省 */
@@ -226,8 +277,16 @@ export interface InferenceMetrics {
   promptTokens?: number | null;
   /** 缓存命中率 (0 ~ 100) */
   cacheHitRatio?: number | null;
-  /** 首字延迟估算 (TTFT, ms) */
+  /** 首字延迟估算 (TTFT, ms) —— NInfer 口径：含排队等待 */
   ttftMs?: number | null;
+  /** 排队等待耗时 (ms)，来自 NInfer done 行 queue 段或 JSONL engine_timing.queue_wait_seconds */
+  queueMs?: number | null;
+  /** 模型思考 tokens（NInfer JSONL result.model_thinking_tokens，含在产出内） */
+  thinkingTokens?: number | null;
+  /** 引擎实例 id（NInfer JSONL server_instance_id，用于引擎重启后的轮次隔离） */
+  instanceId?: string | null;
+  /** 请求任务 id（NInfer req#N / llama.cpp task id） */
+  taskId?: string;
   /** 总耗时 (ms) */
   totalTimeMs?: number | null;
 }
@@ -246,6 +305,8 @@ export interface DiskUsage {
   freeBytes: number;
 }
 
+export type CommunitySource = "hf" | "ms";
+
 export interface HfModel {
   id: string;
   author: string;
@@ -261,6 +322,8 @@ export interface HfModel {
   parametersB?: number | null;
   /** 从量化标签解析出的比特位（如 Q4_K_M → 4、IQ3_M → 3）；无法识别时为 null */
   quantBits?: number | null;
+  /** 模型所属社区源（hf: HuggingFace，ms: ModelScope） */
+  source?: CommunitySource;
 }
 
 export interface HfFile {
@@ -284,6 +347,48 @@ export interface ModelDownloadProgress {
   total: number;
   speedBps: number;
   message: string;
+}
+
+/** 模型下载命令的结构化错误码 */
+export type DownloadErrorCode =
+  | "download_taken_over"
+  | "download_cancelled"
+  | "download_paused"
+  | "hf_gated_need_token"
+  | "hf_gated_no_permission"
+  | "download_failed";
+
+export interface DownloadErrorPayload {
+  code: DownloadErrorCode;
+  message: string;
+}
+
+/** 前端本地持久化的下载任务状态 */
+export interface ActiveDownload {
+  /** 任务唯一标识（新建任务即生成，取消 / 暂停 / 删除 / 恢复都按它精确命中单个任务） */
+  taskId: string;
+  /** 关联仓库（直链下载为 "direct-url"） */
+  repo: string;
+  file: string;
+  sizeBytes: number;
+  startedAt: number;
+  status: "active" | "done" | "error" | "cancelled";
+  percent?: number;
+  downloaded?: number;
+  total?: number;
+  speedBps?: number;
+  /** 完成 / 失败时的本地完整路径 */
+  path?: string;
+  /** 失败时的错误信息 */
+  error?: string;
+  /** 失败时的错误类型（用于任务卡片的闭环引导：needs-token / no-permission） */
+  errorKind?: "needs-token" | "no-permission";
+  /** 完成时间戳 */
+  finishedAt?: number;
+  /** 直链任务保留原始 URL（恢复 / 重试时重新发起） */
+  url?: string;
+  /** 任务所属社区源（hf: HuggingFace，ms: ModelScope） */
+  source?: CommunitySource;
 }
 
 

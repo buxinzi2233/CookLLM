@@ -2,7 +2,7 @@ import { AlertTriangle, Check, Copy, Cpu, Gauge, LayoutGrid, List, ListChecks, M
 import { useEffect, useState } from "react";
 import { useI18n } from "../i18n";
 import { usePointerReorder } from "../hooks/usePointerReorder";
-import { DEFAULT_PROFILES, uid } from "../data";
+import { DEFAULT_NINFER_PROFILES, DEFAULT_PROFILES, uid } from "../data";
 import type { LlamaEngine, ModelAsset, Profile } from "../types";
 import { ACCENTS, cn, fileName, modelTitle } from "../utils";
 import ConfirmModal from "./ConfirmModal";
@@ -122,15 +122,20 @@ export default function ProfilesPage({
     setSelectMode(false);
   };
 
-  const freshProfile = (): Profile => ({ ...DEFAULT_PROFILES[0], id: uid("profile"), name: t("profile.newName"), description: t("profile.newDesc") });
+  const freshProfile = (target?: ModelAsset): Profile => ({
+    ...(target && isModelNinfer(target) ? DEFAULT_NINFER_PROFILES[0] : DEFAULT_PROFILES[0]),
+    id: uid("profile"),
+    name: t("profile.newName"),
+    description: t("profile.newDesc"),
+  });
   const create = () => {
     setMenuProfileId(null);
     const targetPool = filteredModels.length ? filteredModels : models;
     if (allMode) {
-      if (targetPool.length === 1) onEdit(targetPool[0].id, freshProfile());
+      if (targetPool.length === 1) onEdit(targetPool[0].id, freshProfile(targetPool[0]));
       else { setPickModelOpen(true); }
     } else if (model) {
-      onEdit(model.id, freshProfile());
+      onEdit(model.id, freshProfile(model));
     }
   };
 
@@ -190,7 +195,7 @@ export default function ProfilesPage({
         <div className="profile-stat-grid">
           <div>
             <span>{isNinfer ? "KV Dtype" : t("statGpuOffload")}</span>
-            <strong>{isNinfer ? (profile.kvDtype?.toUpperCase() || "RK8V4") : `${profile.gpuLayers}${t("profiles.layersSuffix")}`}</strong>
+            <strong>{isNinfer ? (profile.kvDtype?.toUpperCase() || "K8V4") : `${profile.gpuLayers}${t("profiles.layersSuffix")}`}</strong>
           </div>
           <div>
             <span>{t("statContext")}</span>
@@ -231,6 +236,14 @@ export default function ProfilesPage({
               title={`${fileName(profile.mmprojPath)}${profile.noMmprojOffload ? ` (${t("f.noMmprojOffload")})` : ""}`}
             >
               {profile.noMmprojOffload ? "mmproj·RAM" : "mmproj"}
+            </span>
+          )}
+          {isNinfer && (profile.vision || profile.visionCpu || profile.visionResidency === "cpu") && (
+            <span
+              className={cn("feature-pill", (profile.visionCpu || profile.visionResidency === "cpu") && "cpu-vision-pill")}
+              title={(profile.visionCpu || profile.visionResidency === "cpu") ? "--vision --vision-cpu" : "--vision"}
+            >
+              {(profile.visionCpu || profile.visionResidency === "cpu") ? "Vision·CPU" : "Vision"}
             </span>
           )}
           {profile.mtp && <span className="feature-pill" title="Speculative MTP">MTP</span>}
@@ -291,7 +304,7 @@ export default function ProfilesPage({
           <div className="profile-row-stat-pills">
             <span title={isNinfer ? "KV Dtype" : t("statGpuOffload")}>
               <MemoryStick size={12} />
-              <strong>{isNinfer ? (profile.kvDtype?.toUpperCase() || "RK8V4") : `${profile.gpuLayers}${t("profiles.layersSuffix")}`}</strong>
+              <strong>{isNinfer ? (profile.kvDtype?.toUpperCase() || "K8V4") : `${profile.gpuLayers}${t("profiles.layersSuffix")}`}</strong>
             </span>
             <span title={t("statContext")}>
               <Gauge size={12} />
@@ -332,6 +345,14 @@ export default function ProfilesPage({
                 title={`${fileName(profile.mmprojPath)}${profile.noMmprojOffload ? ` (${t("f.noMmprojOffload")})` : ""}`}
               >
                 {profile.noMmprojOffload ? "mmproj·RAM" : "mmproj"}
+              </span>
+            )}
+            {isNinfer && (profile.vision || profile.visionCpu || profile.visionResidency === "cpu") && (
+              <span
+                className={cn("feature-pill", (profile.visionCpu || profile.visionResidency === "cpu") && "cpu-vision-pill")}
+                title={(profile.visionCpu || profile.visionResidency === "cpu") ? "--vision --vision-cpu" : "--vision"}
+              >
+                {(profile.visionCpu || profile.visionResidency === "cpu") ? "Vision·CPU" : "Vision"}
               </span>
             )}
             {profile.mtp && <span className="feature-pill" title="Speculative MTP">MTP</span>}
@@ -547,7 +568,7 @@ export default function ProfilesPage({
                     className={cn("pick-model-item", ninfer ? "ninfer" : "gguf")}
                     onClick={() => {
                       setPickModelOpen(false);
-                      onEdit(item.id, freshProfile());
+                      onEdit(item.id, freshProfile(item));
                     }}
                   >
                     <div className="pick-model-item-left">

@@ -1,21 +1,26 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
     fs,
-    io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem},
+    menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     webview::NewWindowResponse,
     AppHandle, Emitter, Manager, State,
 };
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
+
+mod app_update;
+mod config;
+mod downloads;
+mod engines;
+mod process;
+mod server_args;
+mod system;
 
 #[cfg(target_os = "linux")]
 mod platform;
@@ -23,186 +28,52 @@ mod platform;
 mod linux_engine_update;
 #[cfg(target_os = "linux")]
 mod linux_app_update;
+#[cfg(target_os = "linux")]
+mod linux_model_download;
 #[cfg(all(test, target_os = "linux"))]
 mod linux_port_tests;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ModelAsset {
-    id: String,
-    name: String,
-    /// 自定义显示名；空则回退到 name。
-    #[serde(default)]
-    display_name: Option<String>,
-    path: String,
-    size_bytes: u64,
-    architecture: String,
-    quantization: String,
-    parameters: String,
-    /// 该模型专属的运行预设。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    profiles: Vec<Profile>,
-    /// 旧版全局预设引用，仅用于读取旧配置文件以回填 profiles。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    profile_ids: Vec<String>,
-    /// 该模型的默认启动预设 id。
-    #[serde(default)]
-    default_profile_id: Option<String>,
-    accent: String,
-    /// 自定义标签（如角色扮演、代码、未知量化补录等）
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    tags: Vec<String>,
-}
+use config::{read_config, AppConfig};
+use downloads::{reveal_in_folder, DownloadRegistry};
+use process::{
+    emit_log, kill_managed_child, start_server_internal, stop_server_internal, ProcessState,
+    PROCESS_LIFECYCLE_LOCK,
+};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Profile {
-    id: String,
-    name: String,
-    description: String,
-    #[serde(default = "default_host")]
-    host: String,
-    port: u16,
-    gpu_layers: i32,
-    context_size: u32,
-    threads: u16,
-    #[serde(default = "default_parallel")]
-    parallel: u32,
-    batch_size: u32,
-    #[serde(default = "default_ubatch_size")]
-    ubatch_size: u32,
-    flash_attention: bool,
-    #[serde(default)]
-    ncmoe_layers: i32,
-    #[serde(default)]
-    mtp: bool,
-    #[serde(default)]
-    mtp_draft_path: Option<String>,
-    #[serde(default = "default_spec_draft_n_max")]
-    spec_draft_n_max: u32,
-    #[serde(default = "default_cache_type")]
-    cache_type_k: String,
-    #[serde(default = "default_cache_type")]
-    cache_type_v: String,
-    #[serde(default)]
-    jinja: bool,
-    #[serde(default = "default_reasoning")]
-    reasoning: String,
-    #[serde(default = "default_reasoning")]
-    reasoning_effort: String,
-    #[serde(default)]
-    reasoning_budget: Option<i32>,
-    #[serde(default = "default_load_mode")]
-    load_mode: String,
-    temperature: f64,
-    top_p: f64,
-    min_p: f64,
-    repeat_penalty: f64,
-    extra_args: String,
-    /// 该预设挂载的图像识别视觉模型（mmproj）；非空时以 --mmproj 附加启动。
-    #[serde(default)]
-    mmproj_path: Option<String>,
-    /// 是否禁止将视觉模型卸载到显存，强制纯系统内存运行（--no-mmproj-offload）
-    #[serde(default)]
-    no_mmproj_offload: bool,
-    /// 该预设关联的 llama.cpp / ninfer 引擎分支 ID；未指定或为空则跟随全局默认主引擎。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    engine_id: Option<String>,
-    /// ninfer / ninfer-kvmem 专属：KV 缓存量化类型（如 rk8v4 / int8 / bf16 / nvfp4）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    kv_dtype: Option<String>,
-    /// ninfer 专属：预填充分块 Token 数（128 的倍数，如 256 / 512）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    prefill_chunk: Option<u32>,
-    /// ninfer 专属：快速预热内核开关（--fast-prefill-kernel）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    fast_prefill_kernel: Option<bool>,
-    /// ninfer 专属：显存分配策略（strict / mixed / default）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cuda_memory_policy: Option<String>,
-    /// ninfer 专属：CUDA 显卡序号（--device N）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    device_index: Option<u32>,
-    /// ninfer 专属：硬件调优 Profile（off / auto / calibrate）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    device_profile: Option<String>,
-    /// ninfer 专属：自定义 Jinja 对话模板路径（--chat-template FILE）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    chat_template_path: Option<String>,
-    /// ninfer 专属：硬件路线 profile 配置文件路径（--device-profile-path FILE）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    device_profile_path: Option<String>,
-    /// ninfer 专属：自适应 MTP 投机采样开关
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    spec_mtp: Option<bool>,
-    /// ninfer 专属：MTP 草稿 Token 步数（--draft-tokens N）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    draft_tokens: Option<u32>,
-    /// ninfer 专属：自适应草稿衰减（--adaptive-mtp）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    adaptive_mtp: Option<bool>,
-    /// ninfer 专属：N-gram 匹配步数（--ngram-draft-tokens N）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    ngram_draft_tokens: Option<u32>,
-    /// 单 ninfer 专属：系统内存借用大小（--host-cache-mib MiB）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    host_cache_mib: Option<u32>,
-    /// 单 ninfer 专属：KV 缓存总上限（--kv-capacity tokens）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    kv_capacity: Option<u32>,
-    /// ninfer-kvmem 专属：GPU 历史 KV 预算（--kvmem-budget tokens）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    kvmem_budget: Option<u32>,
-    /// ninfer-kvmem 专属：GPU 生成预留显存（--kvmem-gen-reserve tokens）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    kvmem_gen_reserve: Option<u32>,
-    /// ninfer-kvmem 专属：主机内存预算配额（--kvmem-host-mib MiB）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    kvmem_host_mib: Option<u32>,
-    /// ninfer-kvmem 专属：历史会话保持数量（--kvmem-sessions 1..16）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    kvmem_sessions: Option<u32>,
-    /// ninfer 专属：默认输出 Token 上限（--default-max-tokens；0 = 不限制生成到上下文耗尽。
-    /// 思考 token 计入输出上限，服务端默认 8192 会截断 xhigh 长思考；NInfer 官方模板即为 0）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    default_max_tokens: Option<u32>,
-    /// ninfer 专属：top-k 采样（--top-k N，0..20；NInfer 官方模板为 20）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    top_k: Option<u32>,
-    /// ninfer 专属：采样随机种子（--seed N；NInfer 官方模板为 42，保证测试可复现）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    seed: Option<i64>,
-    /// ninfer 专属：CUDA Graph 驱动状态预留显存（--cuda-graph-allowance-mib MiB；NInfer 官方模板为 72）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cuda_graph_allowance_mib: Option<u32>,
-}
+// Linux 专用模块（platform / linux_engine_update / linux_app_update / linux_model_download）
+// 沿用拆分前单体 lib.rs 的 `use super::*` 写法；这里把它们原本同处一处的依赖重新暴露到
+// crate 根，使这些模块无需改写即可访问拆分后分散到各模块的符号（可见性已相应提升为 pub(crate)）。
+#[cfg(target_os = "linux")]
+#[allow(unused_imports)]
+use std::{
+    collections::HashMap,
+    process::{Child, Command, Stdio},
+    sync::{atomic::{AtomicBool, Ordering}, Arc},
+};
+#[cfg(target_os = "linux")]
+#[allow(unused_imports)]
+pub(crate) use crate::{
+    app_update::{
+        automatic_install_gate, emit_download_progress, installer_digest, AppInstallResult,
+        AppUpdateInfo, CancelFlag, CancelGuard, APP_GITHUB_REPO, APP_UPDATE_CANCEL,
+    },
+    config::{save_config, NetworkConfig},
+    downloads::{emit_model_progress, free_disk_space, DownloadTaskControl, HfDownloadResult},
+    engines::{
+        llama_api_base, LlamaCppAsset, LlamaCppRelease, LLAMA_CPP_REPO, LLAMACPP_UPDATE_CANCEL,
+    },
+    process::managed_child_exited,
+    system::{
+        build_net_client, build_net_client_with_environment, detect_hardware, query_gpu_stats_at,
+        test_proxy_with_client, BusyGuard, HF_UA,
+    },
+};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LlamaEngine {
-    id: String,
-    name: String,
-    path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    backend: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cuda_version: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    version: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    created_at: Option<u64>,
-    /// 引擎架构类型：llamacpp（默认） | ninfer | ninfer_kvmem
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    engine_type: Option<String>,
-}
-
-fn default_host() -> String { "0.0.0.0".into() }
-fn default_parallel() -> u32 { 1 }
-fn default_ubatch_size() -> u32 { 256 }
-fn default_cache_type() -> String { "f32".into() }
-fn default_reasoning() -> String { "auto".into() }
-fn default_load_mode() -> String { "mmap".into() }
-fn default_spec_draft_n_max() -> u32 { 3 }
+// Linux 端口测试模块通过 `use super::*` 复用拆分前同处单体 lib.rs 的符号。
+#[cfg(all(test, target_os = "linux"))]
+use engines::{collect_server_candidates, find_executable, find_server_executable};
+#[cfg(all(test, target_os = "linux"))]
+use process::{configured_engine_paths, find_orphan_servers, ManagedProcess, ServerStatus};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -230,589 +101,11 @@ fn log_timing(t: &StartupTiming) {
     );
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AppConfig {
-    server_path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    active_engine_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    engines: Vec<LlamaEngine>,
-    models: Vec<ModelAsset>,
-    /// 旧版全局预设池，仅兼容旧配置文件；新配置的预设已内置于每个模型。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    profiles: Vec<Profile>,
-    /// 界面主题：light(默认) 或 dark。
-    #[serde(default)]
-    theme: Option<String>,
-    /// 全局标签库池（用户自定义维护的标签列表）
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    custom_tags: Vec<String>,
-    /// 界面语言：zh（默认）/ en，设置页可切换并持久化
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    language: Option<String>,
-    /// GPU performance monitor toggle (default on; AMD/unsupported GPUs can disable).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    gpu_monitor_enabled: Option<bool>,
-    /// 社区探索「刻面筛选」侧边栏是否折叠（默认展开）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    explore_sidebar_collapsed: Option<bool>,
-    /// Hugging Face 授权 Token（门禁模型下载必需；明文保存在本地配置文件中）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    hf_token: Option<String>,
-    /// 最近一次 whoami 验证通过的用户名（设置页展示「已绑定」状态用）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    hf_token_user: Option<String>,
-    preferred_model_id: Option<String>,
-    preferred_profile_id: Option<String>,
-    /// 网络与代理配置（跟随系统 / 手动代理 / GitHub 镜像）；缺省为跟随系统。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    network: Option<NetworkConfig>,
-    /// 自定义 llama.cpp 安装目录；缺省为应用数据目录下的 llamacpp。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    llamacpp_dir: Option<String>,
-    /// 模型存储根目录（社区下载 / 自动扫描）；缺省为应用数据目录下的 models。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    models_dir: Option<String>,
-    /// 启动时自动检查应用更新；缺省开启。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    auto_update_enabled: Option<bool>,
-    /// 关闭主窗口时是否最小化到托盘（缺省开启）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    minimize_to_tray_on_close: Option<bool>,
-    /// 用户选定的硬件加速后端（cuda / vulkan / cpu）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    llama_backend: Option<String>,
-    /// 用户选定的 CUDA 版本偏好（如 "13"、"13.4"、"12" 等）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    llama_cuda_version: Option<String>,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            server_path: String::new(),
-            active_engine_id: None,
-            engines: Vec::new(),
-            models: Vec::new(),
-            profiles: vec![Profile {
-                id: "balanced".into(),
-                name: "均衡模式".into(),
-                description: "日常对话与编码的推荐配置".into(),
-                host: default_host(),
-                port: 9931,
-                gpu_layers: 35,
-                context_size: 8192,
-                threads: 8,
-                parallel: default_parallel(),
-                batch_size: 512,
-                ubatch_size: default_ubatch_size(),
-                flash_attention: true,
-                ncmoe_layers: 0,
-                mtp: false,
-                mtp_draft_path: None,
-                spec_draft_n_max: default_spec_draft_n_max(),
-                cache_type_k: default_cache_type(),
-                cache_type_v: default_cache_type(),
-                jinja: true,
-                reasoning: default_reasoning(),
-                reasoning_effort: default_reasoning(),
-                reasoning_budget: None,
-                load_mode: default_load_mode(),
-                temperature: 0.7,
-                top_p: 0.9,
-                min_p: 0.05,
-                repeat_penalty: 1.1,
-                extra_args: String::new(),
-                mmproj_path: None,
-                no_mmproj_offload: false,
-                engine_id: None,
-                kv_dtype: None,
-                prefill_chunk: None,
-                fast_prefill_kernel: None,
-                cuda_memory_policy: None,
-                device_index: None,
-                device_profile: None,
-                chat_template_path: None,
-                device_profile_path: None,
-                spec_mtp: None,
-                draft_tokens: None,
-                adaptive_mtp: None,
-                ngram_draft_tokens: None,
-                host_cache_mib: None,
-                kv_capacity: None,
-                kvmem_budget: None,
-                kvmem_gen_reserve: None,
-                kvmem_host_mib: None,
-                kvmem_sessions: None,
-                default_max_tokens: None,
-                top_k: None,
-                seed: None,
-                cuda_graph_allowance_mib: None,
-            }],
-            theme: None,
-            custom_tags: Vec::new(),
-            language: None,
-            gpu_monitor_enabled: None,
-            explore_sidebar_collapsed: None,
-            hf_token: None,
-            hf_token_user: None,
-            preferred_model_id: None,
-            preferred_profile_id: None,
-            network: None,
-            llamacpp_dir: None,
-            models_dir: None,
-            auto_update_enabled: None,
-            minimize_to_tray_on_close: None,
-            llama_backend: None,
-            llama_cuda_version: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ServerStatus {
-    running: bool,
-    pid: Option<u32>,
-    port: Option<u16>,
-    model_id: Option<String>,
-    model_name: Option<String>,
-    profile_id: Option<String>,
-    profile_name: Option<String>,
-    started_at: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    engine_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    engine_backend: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    engine_type: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct LogPayload {
-    stream: String,
-    line: String,
-    timestamp: u64,
-}
-
-struct ManagedProcess {
-    child: Child,
-    status: ServerStatus,
-}
-
-/// 本进程托管的 llama-server；None 表示未运行。
-#[derive(Default)]
-struct ProcessState(
-    Mutex<Option<ManagedProcess>>,
-    #[cfg(target_os = "linux")] Mutex<HashMap<u32, platform::ProcessIdentity>>,
-);
-
 #[derive(Default)]
 struct TimingState(Mutex<StartupTiming>);
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
-}
-
-const APP_GITHUB_REPO: &str = "Crvesoft/CookLLM";
-
-fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let directory = app.path().app_config_dir().map_err(|error| error.to_string())?;
-    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-    Ok(directory.join("config.json"))
-}
-
-/// 配置读取缓存：按（路径, mtime）命中，避免每个命令都重新读盘解析 JSON
-/// （hf_avatar 每个作者一次、hf_download / start_server 等十余处高频调用）。
-/// save_config 落盘后 mtime 变化，缓存自动失效，无需手动清理。
-struct ConfigCacheEntry {
-    path: PathBuf,
-    modified: Option<SystemTime>,
-    config: AppConfig,
-}
-static CONFIG_CACHE: OnceLock<Mutex<Option<ConfigCacheEntry>>> = OnceLock::new();
-
-fn file_mtime(path: &Path) -> Option<SystemTime> {
-    fs::metadata(path).and_then(|meta| meta.modified()).ok()
-}
-
-fn read_config(app: &AppHandle) -> Result<AppConfig, String> {
-    let path = config_path(app)?;
-    if !path.exists() {
-        return Ok(AppConfig::default());
-    }
-    let modified = file_mtime(&path);
-    if let Ok(guard) = CONFIG_CACHE.get_or_init(|| Mutex::new(None)).lock() {
-        if let Some(entry) = guard.as_ref() {
-            if entry.path == path && entry.modified == modified {
-                return Ok(entry.config.clone());
-            }
-        }
-    }
-    let contents = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    let mut config: AppConfig = serde_json::from_str(&contents).map_err(|error| error.to_string())?;
-    for eng in &mut config.engines {
-        let p = PathBuf::from(&eng.path);
-        if let Some(parent) = p.parent() {
-            if let Some(installed) = get_installed_cuda_version(parent) {
-                eng.cuda_version = Some(installed);
-            }
-        }
-    }
-    if let Ok(mut guard) = CONFIG_CACHE.get_or_init(|| Mutex::new(None)).lock() {
-        *guard = Some(ConfigCacheEntry { path: path.clone(), modified, config: config.clone() });
-    }
-    Ok(config)
-}
-
-fn emit_log(app: &AppHandle, stream: &str, line: impl Into<String>) {
-    let _ = app.emit("llama-log", LogPayload { stream: stream.into(), line: line.into(), timestamp: now_ms() });
-}
-
-fn stream_reader<R: std::io::Read + Send + 'static>(app: AppHandle, stream: &'static str, reader: R) {
-    std::thread::spawn(move || {
-        for line in BufReader::new(reader).lines().map_while(Result::ok) {
-            emit_log(&app, stream, line);
-        }
-    });
-}
-
-/// Linux 状态检查保留已退出组长的 PID，直到整个托管组清理完成。
-fn managed_child_exited(managed: &mut ManagedProcess) -> Result<bool, String> {
-    #[cfg(target_os = "linux")]
-    { platform::child_exited(&managed.child).map_err(|e| e.to_string()) }
-    #[cfg(not(target_os = "linux"))]
-    { managed.child.try_wait().map(|status| status.is_some()).map_err(|e| e.to_string()) }
-}
-
-/// 停止托管进程：Linux 温和退出后限时清理整个独立组；Windows 保持 taskkill 树清理。
-fn kill_managed_child(managed: &mut ManagedProcess) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    { platform::stop_group(&mut managed.child, std::time::Duration::from_millis(800)).map_err(|e| e.to_string()) }
-    #[cfg(not(target_os = "linux"))]
-    {
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            let _ = Command::new("taskkill")
-                .args(["/PID", &managed.child.id().to_string(), "/T", "/F"])
-                .creation_flags(0x08000000)
-                .output();
-        }
-        #[cfg(not(windows))]
-        { let _ = managed.child.kill(); }
-        let deadline = now_ms() + 5000;
-        loop {
-            match managed.child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if now_ms() >= deadline => break,
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-                Err(_) => break,
-            }
-        }
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-fn get_process_path(pid: u32) -> Option<String> {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-    unsafe {
-        let handle: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle.is_null() || handle == -1isize as HANDLE {
-            return None;
-        }
-        let mut buf = [0u16; 1024];
-        let mut size = buf.len() as u32;
-        let success = QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut size);
-        CloseHandle(handle);
-        if success != 0 && size > 0 {
-            String::from_utf16(&buf[..size as usize]).ok()
-        } else {
-            None
-        }
-    }
-}
-
-#[cfg(not(any(windows, target_os = "linux")))]
-fn get_process_path(_pid: u32) -> Option<String> {
-    None
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OrphanProcessItem {
-    pid: u32,
-    name: String,
-    path: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OrphanServerInfo {
-    has_orphan: bool,
-    pids: Vec<u32>,
-    processes: Vec<OrphanProcessItem>,
-}
-
-/// 收集配置中已登记的所有 server 可执行程序文件名（包括默认路径与多分支）
-#[cfg(not(target_os = "linux"))]
-fn collect_configured_exe_names(config: Option<&AppConfig>) -> Vec<String> {
-    let mut names = Vec::new();
-    if let Some(cfg) = config {
-        let trimmed = cfg.server_path.trim();
-        if !trimmed.is_empty() {
-            if let Some(n) = Path::new(trimmed).file_name().and_then(|n| n.to_str()) {
-                names.push(n.to_string());
-            }
-        }
-        for eng in &cfg.engines {
-            let p = eng.path.trim();
-            if !p.is_empty() {
-                if let Some(n) = Path::new(p).file_name().and_then(|n| n.to_str()) {
-                    let s = n.to_string();
-                    if !names.contains(&s) {
-                        names.push(s);
-                    }
-                }
-            }
-        }
-    }
-    names
-}
-
-/// 探测系统中未被 CookLLM 当前生命周期托管的 server 进程（包括 llama-server 与分支自定义名称，如 llama-kvmem-server.exe）
-#[cfg(not(target_os = "linux"))]
-fn find_orphan_servers(managed_pid: Option<u32>, custom_exe_names: &[String]) -> Vec<OrphanProcessItem> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        let mut queries = vec!["IMAGENAME eq llama*".to_string()];
-        for custom in custom_exe_names {
-            let custom_lower = custom.to_lowercase();
-            if !custom_lower.starts_with("llama") && custom_lower.ends_with(".exe") {
-                let q = format!("IMAGENAME eq {}", custom);
-                if !queries.contains(&q) {
-                    queries.push(q);
-                }
-            }
-        }
-
-        let mut items = Vec::new();
-        let mut seen_pids = Vec::new();
-
-        for query in queries {
-            let output = Command::new("tasklist")
-                .args(["/FI", &query, "/FO", "CSV", "/NH"])
-                .creation_flags(0x08000000)
-                .output();
-            let Ok(output) = output else { continue; };
-            let text = String::from_utf8_lossy(&output.stdout);
-            for line in text.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with("INFO:") || line.starts_with("信息:") {
-                    continue;
-                }
-                let parts: Vec<&str> = line.split(',').collect();
-                if parts.len() >= 2 {
-                    let name = parts[0].trim_matches('"').to_string();
-                    let name_lower = name.to_lowercase();
-                    let is_match = name_lower == "llama-server.exe"
-                        || (name_lower.starts_with("llama") && name_lower.contains("server"))
-                        || custom_exe_names.iter().any(|c| c.eq_ignore_ascii_case(&name));
-
-                    if is_match {
-                        if let Ok(pid) = parts[1].trim_matches('"').parse::<u32>() {
-                            if managed_pid != Some(pid) && !seen_pids.contains(&pid) {
-                                seen_pids.push(pid);
-                                let path = get_process_path(pid);
-                                items.push(OrphanProcessItem { pid, name, path });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        items
-    }
-    #[cfg(not(windows))]
-    {
-        let mut patterns = vec!["llama-server".to_string(), "llama.*server".to_string()];
-        for custom in custom_exe_names {
-            if !patterns.iter().any(|p| p == custom) {
-                patterns.push(custom.to_string());
-            }
-        }
-
-        let mut items = Vec::new();
-        let mut seen_pids = Vec::new();
-
-        for pattern in patterns {
-            let output = Command::new("pgrep")
-                .args(["-l", "-f", &pattern])
-                .output();
-            let Ok(output) = output else { continue; };
-            let text = String::from_utf8_lossy(&output.stdout);
-            for line in text.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if !parts.is_empty() {
-                    if let Ok(pid) = parts[0].parse::<u32>() {
-                        if managed_pid != Some(pid) && !seen_pids.contains(&pid) {
-                            seen_pids.push(pid);
-                            let name = parts.get(1).unwrap_or(&"llama-server").to_string();
-                            let path = get_process_path(pid);
-                            items.push(OrphanProcessItem { pid, name, path });
-                        }
-                    }
-                }
-            }
-        }
-        items
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn configured_engine_paths(config: &AppConfig) -> Vec<PathBuf> {
-    // Full paths only: a configured basename must not authorize other directories.
-    std::iter::once(config.server_path.as_str()).chain(config.engines.iter().map(|e| e.path.as_str()))
-        .filter(|p| !p.is_empty())
-        .filter_map(|p| fs::canonicalize(p).ok())
-        .collect()
-}
-
-#[cfg(target_os = "linux")]
-fn find_orphan_servers(managed_pid: Option<u32>, paths: &[PathBuf]) -> Vec<platform::ProcessIdentity> {
-    platform::discover_engines(paths, managed_pid)
-}
-
-/// Linux 外部清理仅作用于上次发现且本次重新核验的明确 PID，不清理其进程组。
-#[cfg(target_os = "linux")]
-#[tauri::command]
-fn kill_orphan_server(app: AppHandle, state: State<ProcessState>, pids: Option<Vec<u32>>) -> Result<usize, String> {
-    let _lifecycle = PROCESS_LIFECYCLE_LOCK.lock().map_err(|_| "进程生命周期锁已损坏")?;
-    let managed_pid = state.0.lock().map_err(|_| "进程状态锁已损坏")?.as_ref().map(|m| m.child.id());
-    let mut pids = pids.filter(|p| !p.is_empty()).ok_or("请先检查后台引擎并明确选择待清理的 PID")?;
-    pids.sort_unstable();
-    pids.dedup();
-    let config = read_config(&app)?;
-    let paths = configured_engine_paths(&config);
-    let mut discovered = state.1.lock().map_err(|_| "发现进程锁已损坏")?;
-    // Validate the entire selection before sending any signal. pidfds pin process identity.
-    let handles = pids.iter().map(|pid| {
-        let expected = discovered.get(pid).ok_or_else(|| format!("PID {pid} 未出现在已发现的引擎列表，请刷新"))?;
-        platform::verified_pidfd(expected, &paths, managed_pid)
-    }).collect::<Result<Vec<_>, String>>()?;
-    for (pid, fd) in pids.iter().zip(&handles) {
-        platform::stop_external(fd, std::time::Duration::from_millis(800))?;
-        discovered.remove(pid);
-    }
-    Ok(handles.len())
-}
-
-/// 检查是否存在后台残留的 server 进程
-#[tauri::command]
-fn check_orphan_server(app: AppHandle, state: State<ProcessState>) -> Result<OrphanServerInfo, String> {
-    #[cfg(target_os = "linux")]
-    let _lifecycle = PROCESS_LIFECYCLE_LOCK.lock().map_err(|_| "进程生命周期锁已损坏")?;
-    let managed_pid = {
-        let mut guard = state.0.lock().map_err(|_| "进程状态锁已损坏")?;
-        if let Some(managed) = guard.as_mut() {
-            if managed_child_exited(managed)? {
-                #[cfg(target_os = "linux")]
-                kill_managed_child(managed)?;
-                *guard = None;
-                None
-            } else {
-                Some(managed.child.id())
-            }
-        } else {
-            None
-        }
-    };
-
-    #[cfg(not(target_os = "linux"))]
-    let processes = {
-        let config = read_config(&app).ok();
-        let custom_exe_names = collect_configured_exe_names(config.as_ref());
-        find_orphan_servers(managed_pid, &custom_exe_names)
-    };
-    #[cfg(target_os = "linux")]
-    let processes = {
-        let config = read_config(&app)?;
-        let discovered = find_orphan_servers(managed_pid, &configured_engine_paths(&config));
-        let items = discovered.iter().map(|p| OrphanProcessItem {
-            pid: p.pid,
-            name: p.exe.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-            path: Some(p.exe.to_string_lossy().into_owned()),
-        }).collect::<Vec<_>>();
-        *state.1.lock().map_err(|_| "发现进程锁已损坏")? = discovered.into_iter().map(|p| (p.pid, p)).collect();
-        items
-    };
-    let pids = processes.iter().map(|p| p.pid).collect();
-    Ok(OrphanServerInfo {
-        has_orphan: !processes.is_empty(),
-        pids,
-        processes,
-    })
-}
-
-/// 终止指定的（或全部未托管的）后台残留 server 进程
-#[cfg(not(target_os = "linux"))]
-#[tauri::command]
-fn kill_orphan_server(app: AppHandle, state: State<ProcessState>, pids: Option<Vec<u32>>) -> Result<usize, String> {
-    let managed_pid = {
-        let guard = state.0.lock().map_err(|_| "进程状态锁已损坏")?;
-        guard.as_ref().map(|m| m.child.id())
-    };
-
-    let target_pids: Vec<u32> = match pids {
-        Some(list) if !list.is_empty() => list
-            .into_iter()
-            .filter(|&pid| Some(pid) != managed_pid)
-            .collect(),
-        _ => {
-            let config = read_config(&app).ok();
-            let custom_exe_names = collect_configured_exe_names(config.as_ref());
-            find_orphan_servers(managed_pid, &custom_exe_names).into_iter().map(|p| p.pid).collect()
-        }
-    };
-
-    let count = target_pids.len();
-    if count == 0 {
-        return Ok(0);
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        for pid in &target_pids {
-            let _ = Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .creation_flags(0x08000000)
-                .output();
-        }
-    }
-
-    #[cfg(not(windows))]
-    {
-        for pid in &target_pids {
-            let _ = Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .output();
-        }
-    }
-
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    Ok(count)
-}
-
-#[tauri::command]
-fn load_config(app: AppHandle) -> Result<AppConfig, String> {
-    read_config(&app)
 }
 
 /// Windows 沉浸式深色标题栏：DWMWA_USE_IMMERSIVE_DARK_MODE (20)。
@@ -842,8 +135,6 @@ mod titlebar {
 /// 按应用主题同步系统标题栏：暗色主题时让 Windows 窗口标题栏变黑，亮色恢复默认。
 #[tauri::command]
 fn set_window_theme(window: tauri::WebviewWindow, dark: bool) -> Result<(), String> {
-    #[cfg(not(target_os = "windows"))]
-    let _ = (window, dark);
     #[cfg(target_os = "windows")]
     {
         let hwnd = window.hwnd().map_err(|error| error.to_string())?;
@@ -851,782 +142,349 @@ fn set_window_theme(window: tauri::WebviewWindow, dark: bool) -> Result<(), Stri
         let raw: *mut std::ffi::c_void = unsafe { std::mem::transmute(hwnd) };
         titlebar::set_dark_mode(raw, dark);
     }
+    #[cfg(not(target_os = "windows"))]
+    let _ = (window, dark);
     Ok(())
 }
 
+/// 录制快捷键或打开快捷键弹窗时临时暂停全局热键，避免冲突与按键拦截
 #[tauri::command]
-fn save_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
-    let path = config_path(&app)?;
-    if cfg!(target_os = "linux") {
-        #[cfg(target_os = "linux")]
-        return linux_engine_update::save_config_atomic(&path, &config);
+fn set_shortcuts_recording_mode(app: AppHandle, recording: bool) -> Result<(), String> {
+    if recording {
+        let gs = app.global_shortcut();
+        let _ = gs.unregister_all();
+    } else if let Ok(config) = read_config(&app) {
+        sync_global_shortcuts(&app, &config);
     }
-    let temporary = path.with_extension("json.tmp");
-    let backup = path.with_extension("json.bak");
-    let contents = serde_json::to_vec_pretty(&config).map_err(|error| error.to_string())?;
-    fs::write(&temporary, &contents).map_err(|error| error.to_string())?;
-    // Windows 的 rename 不能覆盖已存在目标：旧文件先挪为 .bak，rename 失败立即回滚，任何一步中断都不会丢配置
-    if path.exists() {
-        fs::rename(&path, &backup).map_err(|error| error.to_string())?;
-    }
-    if let Err(error) = fs::rename(&temporary, &path) {
-        let _ = fs::rename(&backup, &path);
-        return Err(error.to_string());
-    }
-    let _ = fs::remove_file(&backup);
     Ok(())
 }
 
-fn update_tray_status(app: &AppHandle, running_model: Option<&str>) {
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TrayServerState {
+    Stopped,
+    Starting { model_name: String, port: u16 },
+    Running { model_name: String, port: u16 },
+    Failed { model_name: String, error: String },
+}
+
+static CURRENT_TRAY_STATE: OnceLock<Mutex<TrayServerState>> = OnceLock::new();
+
+pub(crate) fn get_tray_state() -> TrayServerState {
+    CURRENT_TRAY_STATE
+        .get_or_init(|| Mutex::new(TrayServerState::Stopped))
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or(TrayServerState::Stopped)
+}
+
+pub(crate) fn set_tray_state(new_state: TrayServerState) {
+    if let Ok(mut g) = CURRENT_TRAY_STATE.get_or_init(|| Mutex::new(TrayServerState::Stopped)).lock() {
+        *g = new_state;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TrayLightColor {
+    Green,
+    Yellow,
+    Red,
+}
+
+pub(crate) static TRAY_PULSE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn update_tray_status(app: &AppHandle, _hint_model: Option<&str>) {
+    let tray_state = get_tray_state();
     if let Some(tray) = app.tray_by_id("main-tray") {
-        let tooltip = match running_model {
-            Some(name) => format!("CookLLM · 运行中: {}", name),
-            None => "CookLLM · 本地大模型管理器".to_string(),
+        let tooltip = match &tray_state {
+            TrayServerState::Starting { model_name, port } => {
+                format!("CookLLM · 启动中: {} (http://127.0.0.1:{})", model_name, port)
+            }
+            TrayServerState::Running { model_name, port } => {
+                format!("CookLLM · 运行中: {} (http://127.0.0.1:{})", model_name, port)
+            }
+            TrayServerState::Failed { model_name, error } => {
+                format!("CookLLM · 启动失败: {} ({})", model_name, error)
+            }
+            TrayServerState::Stopped => "CookLLM · 本地大模型管理器".to_string(),
         };
         let _ = tray.set_tooltip(Some(tooltip));
+        if let Ok(menu) = build_tray_menu(app, &tray_state) {
+            let _ = tray.set_menu(Some(menu));
+        }
+
+        match &tray_state {
+            TrayServerState::Starting { .. } => {
+                start_tray_pulse_animation(app, TrayLightColor::Yellow);
+            }
+            TrayServerState::Running { .. } => {
+                start_tray_pulse_animation(app, TrayLightColor::Green);
+            }
+            TrayServerState::Failed { .. } => {
+                TRAY_PULSE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(base_icon) = app.default_window_icon() {
+                    let red_icon = create_tray_status_icon(base_icon, 0, TrayLightColor::Red);
+                    let _ = tray.set_icon(Some(red_icon));
+                }
+            }
+            TrayServerState::Stopped => {
+                TRAY_PULSE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(default_icon) = app.default_window_icon() {
+                    let _ = tray.set_icon(Some(default_icon.clone()));
+                }
+            }
+        }
     }
 }
 
-/// start/stop 专用串行化锁：kill 旧进程最长 5 秒的等待只占用这把锁，
-/// 不再长时间持有 ProcessState 锁，避免重启/停止期间状态轮询全部卡住。
-static PROCESS_LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
+/// 仅根据当前状态刷新托盘菜单项（模型列表更新时调用），不重启或打断正在运行的呼吸灯
+pub(crate) fn refresh_tray_menu(app: &AppHandle) {
+    let tray_state = get_tray_state();
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        if let Ok(menu) = build_tray_menu(app, &tray_state) {
+            let _ = tray.set_menu(Some(menu));
+        }
+    }
+}
 
-#[tauri::command]
-fn start_server(app: AppHandle, state: State<ProcessState>, model_id: String, profile_id: String) -> Result<ServerStatus, String> {
-    let config = read_config(&app)?;
-    let model = config.models.iter().find(|item| item.id == model_id).cloned().ok_or("未找到模型配置")?;
-    let profile = model.profiles.iter().find(|item| item.id == profile_id)
-        .or_else(|| config.profiles.iter().find(|item| item.id == profile_id))
-        .cloned().ok_or("未找到运行预设")?;
-
-    // 对外模型名：重命名（displayName）优先，无重命名时回退默认名；
-    // API 请求（--alias / --model-id）、托盘与状态栏均以此为准
-    let model_display_name = model
-        .display_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(model.name.as_str())
-        .to_string();
-
-    let (chosen_path, engine_display_name, engine_display_backend) = if let Some(ref eid) = profile.engine_id.filter(|s| !s.trim().is_empty()) {
-        let engine = config.engines.iter().find(|e| &e.id == eid)
-            .ok_or_else(|| format!("未找到预设关联的引擎分支（ID: {}），请在预设中重新选择引擎或在设置中恢复该分支", eid))?;
-        (engine.path.clone(), engine.name.clone(), engine.backend.clone())
-    } else {
-        let active_eng = config.active_engine_id.as_ref()
-            .and_then(|aid| config.engines.iter().find(|e| &e.id == aid));
-        let name = active_eng.map(|e| e.name.clone()).unwrap_or_else(|| "默认引擎".to_string());
-        let backend = active_eng.and_then(|e| e.backend.clone());
-        (config.server_path.clone(), name, backend)
+/// 启动托盘图标右下角呼吸灯动画（按状态切换颜色：启动中琥珀黄，运行中翠绿）
+fn start_tray_pulse_animation(app: &AppHandle, color: TrayLightColor) {
+    let new_gen = TRAY_PULSE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let frames: Vec<tauri::image::Image<'static>> = match app.default_window_icon() {
+        Some(icon) => (0..4).map(|phase| create_tray_status_icon(icon, phase, color)).collect(),
+        None => return,
     };
 
-    if chosen_path.trim().is_empty() {
-        return Err("请先在设置中指定 Server 可执行文件（如 llama-server.exe 或分支版本）".into());
-    }
-    if !PathBuf::from(&chosen_path).exists() {
-        return Err(format!("引擎 Server 文件不存在：{}", chosen_path));
-    }
-    #[cfg(target_os = "linux")]
-    let chosen_path = {
-        let path = fs::canonicalize(&chosen_path).map_err(|e| format!("读取引擎路径失败：{e}"))?;
-        platform::validate_engine(&path)?;
-        path.to_string_lossy().into_owned()
-    };
-    if !PathBuf::from(&model.path).exists() {
-        return Err(format!("模型文件不存在：{}", model.path));
-    }
-    let mmproj_path = profile.mmproj_path.as_deref().filter(|p| !p.trim().is_empty());
-    if let Some(mmproj) = mmproj_path {
-        if !PathBuf::from(mmproj).exists() {
-            return Err(format!("图像识别模型（mmproj）不存在：{}", mmproj));
-        }
-    }
-    let mtp_draft_path = profile.mtp_draft_path.as_deref().filter(|p| !p.trim().is_empty());
-    if let Some(draft) = mtp_draft_path {
-        if !PathBuf::from(draft).exists() {
-            return Err(format!("Draft/MTP 模型不存在：{}", draft));
-        }
-    }
+    let app_handle = app.clone();
+    std::thread::spawn(move || {
+        let mut phase = 0;
+        loop {
+            if TRAY_PULSE_GENERATION.load(std::sync::atomic::Ordering::SeqCst) != new_gen {
+                break;
+            }
 
-    // 在停止已有服务前校验引号，避免拼写错误被静默丢弃。
-    let extra_tokens = shlex::split(&profile.extra_args).ok_or("附加参数引号或转义不完整，请检查运行预设")?;
+            // 当前状态必须是 Starting 或 Running，若已被置为 Stopped 或 Failed 则立即退出循环
+            match get_tray_state() {
+                TrayServerState::Starting { .. } | TrayServerState::Running { .. } => {},
+                _ => break,
+            }
 
-    let mut command = Command::new(&chosen_path);
-    #[cfg(target_os = "linux")]
-    linux_engine_update::managed_launch_env(&mut command, Path::new(&chosen_path),
-        &app.path().app_data_dir().map_err(|e| e.to_string())?.join("llamacpp-managed"))?;
-
-    // 进程生命周期串行化：kill 旧进程的等待在专用锁内进行，ProcessState 锁只做短暂存取
-    let lifecycle = PROCESS_LIFECYCLE_LOCK.lock().map_err(|_| "进程生命周期锁已损坏")?;
-    let previous = { state.0.lock().map_err(|_| "进程状态锁已损坏")?.take() };
-    if let Some(mut running) = previous {
-        if let Err(error) = kill_managed_child(&mut running) {
-            *state.0.lock().map_err(|_| "进程状态锁已损坏")? = Some(running);
-            return Err(error);
-        }
-    }
-
-    // 解析后的 extra_args 用于防冲突去重检测与后续参数拼接
-    let has_extra_arg = |flag: &str| -> bool {
-        extra_tokens.iter().any(|arg| arg == flag || arg.starts_with(&format!("{flag}=")))
-    };
-
-    let engine_type = detect_engine_type(&chosen_path);
-
-    if engine_type == "ninfer" || engine_type == "ninfer_kvmem" {
-        // 1. 模型路径：必须作为首个位置参数，绝对不能加 -m
-        command.arg(&model.path);
-
-        // 1.5 对外 API 模型名：重命名优先；用户 extra_args 显式传 --model-id 时不覆盖
-        if !has_extra_arg("--model-id") {
-            command.arg("--model-id").arg(&model_display_name);
-        }
-
-        // 2. 基础网络监听
-        command
-            .arg("--host").arg(&profile.host)
-            .arg("--port").arg(profile.port.to_string())
-            .arg("--cors");
-
-        // 3. 上下文与槽位
-        command
-            .arg("--max-context").arg(profile.context_size.to_string())
-            .arg("--max-concurrency").arg(profile.parallel.clamp(1, 8).to_string());
-
-        // 3.5 默认输出上限：仅当显式设置 > 0 时才传递；若为 0 或未设置则缺省不传，
-        // 此时 NInfer 会按官方规则自动采用最大可用限额，避免报 “--default-max-tokens must be positive”
-        if !has_extra_arg("--default-max-tokens") {
-            if let Some(tokens) = profile.default_max_tokens {
-                if tokens > 0 {
-                    command.arg("--default-max-tokens").arg(tokens.to_string());
+            // 运行时二次校验，确保子进程存活
+            let is_alive = {
+                let state = app_handle.try_state::<ProcessState>();
+                if let Some(state) = state {
+                    let mut guard = state.0.lock().ok();
+                    if let Some(guard) = guard.as_mut() {
+                        if let Some(managed) = guard.as_mut() {
+                            match managed.child.try_wait() {
+                                Ok(None) => true,
+                                _ => {
+                                    **guard = None;
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
                 }
-            }
-        }
-
-        // 4. 预填充分块
-        let prefill_chunk = profile.prefill_chunk.unwrap_or_else(|| {
-            let b = profile.batch_size;
-            if b > 0 && b % 128 == 0 { b } else { 256 }
-        });
-        command.arg("--prefill-chunk").arg(prefill_chunk.to_string());
-
-        // 5. 快速预填充核函数
-        let kv_dtype = profile.kv_dtype.as_deref().unwrap_or("rk8v4");
-        let force_fast_prefill = engine_type == "ninfer_kvmem"
-            && matches!(kv_dtype, "int8" | "rk8v4" | "rk4v4" | "rk4v4-e8" | "rk2v4-e8");
-        if (force_fast_prefill || profile.fast_prefill_kernel.unwrap_or(true)) && !has_extra_arg("--fast-prefill-kernel") {
-            command.arg("--fast-prefill-kernel");
-        }
-
-        // 6. KV 数据类型量化
-        command.arg("--kv-dtype").arg(kv_dtype);
-
-        // 7. GPU 设备索引与硬件调优
-        let device = profile.device_index.unwrap_or(0);
-        command.arg("--device").arg(device.to_string());
-
-        let device_profile = profile.device_profile.as_deref().unwrap_or("off");
-        if !has_extra_arg("--device-profile") {
-            command.arg("--device-profile").arg(device_profile);
-        }
-
-        // 7.2 设备 profile 文件路径 (--device-profile-path FILE)
-        // 防踩踏隔离策略：若用户未显式传 --device-profile-path，且选择了 auto/calibrate 硬件标定，
-        // 则按当前引擎执行程序的绝对路径计算隔离存储文件。
-        // 彻底解决多个不同构建版本 NInfer（例如 schema v1 与 v2）互相踩踏全局配置导致每次启动都被迫跑 45 秒标定的问题。
-        if let Some(ref path) = profile.device_profile_path {
-            let p = path.trim();
-            if !p.is_empty() && !has_extra_arg("--device-profile-path") {
-                command.arg("--device-profile-path").arg(p);
-            }
-        } else if device_profile != "off" && !has_extra_arg("--device-profile-path") {
-            if let Ok(app_dir) = app.path().app_data_dir() {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                path_dedupe_key(&chosen_path).hash(&mut hasher);
-                let hash_hex = format!("{:016x}", hasher.finish());
-                let profiles_dir = app_dir.join("device_profiles");
-                let _ = std::fs::create_dir_all(&profiles_dir);
-                let isolated_path = profiles_dir.join(format!("profile_{}.json", hash_hex));
-                command.arg("--device-profile-path").arg(isolated_path);
-            }
-        }
-
-        // 7.3 对话模板路径 (--chat-template FILE)
-        if let Some(ref path) = profile.chat_template_path {
-            let p = path.trim();
-            if !p.is_empty() && !has_extra_arg("--chat-template") {
-                command.arg("--chat-template").arg(p);
-            }
-        }
-
-        // 7.5 CUDA Graph 驱动状态预留显存（NInfer 官方模板 72 MiB；与 device-profile auto 配套）
-        if let Some(allowance) = profile.cuda_graph_allowance_mib {
-            if !has_extra_arg("--cuda-graph-allowance-mib") {
-                command.arg("--cuda-graph-allowance-mib").arg(allowance.to_string());
-            }
-        }
-
-        // 8. 显存策略
-        // 注意：KVMem 引擎具有自身严格的显存分层与历史缓存接管（exclusive ownership of history caching），
-        // 传递 --cuda-memory-policy 会破坏 KVMem 历史独占权并导致 ninfer-kvmem-server 启动报错拒绝服务。
-        // 因此 --cuda-memory-policy 仅在标准 ninfer 引擎下生效。
-        if engine_type == "ninfer" {
-            if let Some(ref policy) = profile.cuda_memory_policy {
-                if !policy.is_empty() && !has_extra_arg("--cuda-memory-policy") {
-                    command.arg("--cuda-memory-policy").arg(policy);
-                }
-            }
-        }
-
-        // 9. 投机采样 (MTP / Draft)
-        // 注意：ninfer-kvmem-server 引擎强制要求 MTP (1..15) 与 Ngram (1..63) 投机采样。
-        let need_spec = if engine_type == "ninfer_kvmem" {
-            true // KVMem 核心必须开启 MTP
-        } else {
-            profile.spec_mtp.unwrap_or(profile.mtp)
-        };
-
-        if need_spec && !has_extra_arg("--spec") {
-            command.arg("--spec").arg("mtp");
-            let draft_tokens = profile.draft_tokens.unwrap_or_else(|| {
-                if profile.spec_draft_n_max > 0 { profile.spec_draft_n_max } else { 4 }
-            }).clamp(1, 15);
-            command.arg("--draft-tokens").arg(draft_tokens.to_string());
-
-            let need_adaptive = if engine_type == "ninfer_kvmem" {
-                true
-            } else {
-                profile.adaptive_mtp.unwrap_or(true)
             };
-            if need_adaptive && !has_extra_arg("--adaptive-mtp") {
-                command.arg("--adaptive-mtp");
-            }
 
-            let mut ngram = profile.ngram_draft_tokens.unwrap_or(31);
-            if profile.parallel > 1 && ngram > 15 {
-                ngram = 15;
-            }
-            command.arg("--ngram-draft-tokens").arg(ngram.clamp(1, 63).to_string());
-            if !has_extra_arg("--ngram-min-match") {
-                command.arg("--ngram-min-match").arg("12");
-            }
-        }
-
-        // 10. 深度思考
-        let reasoning_mode = profile.reasoning.trim().to_lowercase();
-        if reasoning_mode == "off" || reasoning_mode == "force-off" || reasoning_mode == "none" {
-            if !has_extra_arg("--no-thinking") {
-                command.arg("--no-thinking");
-            }
-        } else {
-            if !has_extra_arg("--preserve-thinking") {
-                command.arg("--preserve-thinking");
-            }
-            let effort = profile.reasoning_effort.trim().to_lowercase();
-            let valid_effort = match effort.as_str() {
-                "xhigh" | "high" | "medium" | "low" | "minimal" | "none" => effort.as_str(),
-                _ => "xhigh",
-            };
-            if !has_extra_arg("--default-reasoning-effort") {
-                command.arg("--default-reasoning-effort").arg(valid_effort);
-            }
-        }
-
-        // 11. 采样超参（温度 / Top-P / Min-P 来自预设；Top-K 与种子对齐 NInfer 官方模板）
-        command
-            .arg("--temperature").arg(profile.temperature.to_string())
-            .arg("--top-p").arg(profile.top_p.to_string())
-            .arg("--min-p").arg(profile.min_p.to_string());
-        if let Some(topk) = profile.top_k {
-            if topk > 0 && !has_extra_arg("--top-k") {
-                command.arg("--top-k").arg(topk.to_string());
-            }
-        }
-        if let Some(seed) = profile.seed {
-            if seed >= 0 && !has_extra_arg("--seed") {
-                command.arg("--seed").arg(seed.to_string());
-            }
-        }
-
-        // 12. 引擎特有显存/KVMem 分层管理
-        if engine_type == "ninfer_kvmem" {
-            let budget = profile.kvmem_budget.unwrap_or(32768);
-            let budget_aligned = (budget / 64) * 64;
-            let gen_reserve = profile.kvmem_gen_reserve.unwrap_or(16384);
-            let gen_reserve_aligned = (gen_reserve / 64) * 64;
-            let host_mib = profile.kvmem_host_mib.unwrap_or(12288);
-            let sessions = profile.kvmem_sessions.unwrap_or(1).clamp(1, 16);
-            command
-                .arg("--kvmem-budget").arg(budget_aligned.to_string())
-                .arg("--kvmem-gen-reserve").arg(gen_reserve_aligned.to_string())
-                .arg("--kvmem-host-mib").arg(host_mib.to_string())
-                .arg("--kvmem-sessions").arg(sessions.to_string());
-
-            // sink_tokens 与 recent_tokens 必须对齐 64，且 sink + recent <= budget
-            let half_budget = (budget_aligned / 128) * 64;
-            let default_keep = half_budget.min(5120).max(64);
-            if !has_extra_arg("--kvmem-sink-tokens") {
-                command.arg("--kvmem-sink-tokens").arg(default_keep.to_string());
-            }
-            if !has_extra_arg("--kvmem-recent-tokens") {
-                command.arg("--kvmem-recent-tokens").arg(default_keep.to_string());
-            }
-        } else {
-            let host_mib = profile.host_cache_mib.unwrap_or(6144);
-            command.arg("--host-cache-mib").arg(host_mib.to_string());
-            if let Some(cap) = profile.kv_capacity {
-                if cap > 0 {
-                    command.arg("--kv-capacity").arg(cap.to_string());
+            if !is_alive {
+                if TRAY_PULSE_GENERATION.load(std::sync::atomic::Ordering::SeqCst) == new_gen {
+                    let cur_state = get_tray_state();
+                    match cur_state {
+                        TrayServerState::Starting { model_name, .. } => {
+                            set_tray_state(TrayServerState::Failed {
+                                model_name,
+                                error: "服务启动中意外退出，请查看日志".to_string(),
+                            });
+                            update_tray_status(&app_handle, None);
+                        }
+                        TrayServerState::Running { model_name, .. } => {
+                            set_tray_state(TrayServerState::Failed {
+                                model_name,
+                                error: "服务异常退出，请查看日志".to_string(),
+                            });
+                            update_tray_status(&app_handle, None);
+                        }
+                        _ => {}
+                    }
                 }
+                break;
             }
-        }
 
-        // 13. 用户自定义参数
-        if !extra_tokens.is_empty() {
-            command.args(&extra_tokens);
-        }
-    } else {
-        // llama.cpp 分支参数拼接（100% 保持原有逻辑）
-        command
-            .arg("-m").arg(&model.path);
-        // 对外 API 模型名（--alias）：重命名优先；用户 extra_args 显式传 -a/--alias 时不覆盖
-        if !has_extra_arg("--alias") && !has_extra_arg("-a") {
-            command.arg("--alias").arg(&model_display_name);
-        }
-        if let Some(mmproj) = mmproj_path {
-            command.arg("--mmproj").arg(mmproj);
-            if profile.no_mmproj_offload && !has_extra_arg("--no-mmproj-offload") {
-                command.arg("--no-mmproj-offload");
+            if let Some(tray) = app_handle.tray_by_id("main-tray") {
+                let _ = tray.set_icon(Some(frames[phase % frames.len()].clone()));
             }
-        }
-        if let Some(draft) = mtp_draft_path {
-            command.arg("-md").arg(draft);
-        }
-        command
-            .arg("--host").arg(&profile.host)
-            .arg("--port").arg(profile.port.to_string())
-            .arg("-ngl").arg(profile.gpu_layers.to_string())
-            .arg("-c").arg(profile.context_size.to_string())
-            .arg("-t").arg(profile.threads.to_string())
-            .arg("-np").arg(profile.parallel.to_string())
-            .arg("-b").arg(profile.batch_size.to_string())
-            .arg("-ub").arg(profile.ubatch_size.to_string())
-            .arg("--cache-type-k").arg(&profile.cache_type_k)
-            .arg("--cache-type-v").arg(&profile.cache_type_v)
-            .arg("--load-mode").arg(&profile.load_mode)
-            .arg("--temp").arg(profile.temperature.to_string())
-            .arg("--top-p").arg(profile.top_p.to_string())
-            .arg("--min-p").arg(profile.min_p.to_string())
-            .arg("--repeat-penalty").arg(profile.repeat_penalty.to_string());
 
-        if !has_extra_arg("--reasoning") {
-            match profile.reasoning.trim().to_lowercase().as_str() {
-                "on" => {
-                    command.arg("--reasoning").arg("on");
-                }
-                "auto" => {
-                    command.arg("--reasoning").arg("auto");
-                }
-                "force-off" => {
-                    command.arg("--reasoning").arg("off");
-                }
-                _ => {}
-            }
+            phase = (phase + 1) % frames.len();
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
+    });
+}
 
-        let reasoning_mode = profile.reasoning.trim().to_lowercase();
-        if reasoning_mode != "off" && reasoning_mode != "none" && reasoning_mode != "force-off" {
-            let effort = profile.reasoning_effort.trim().to_lowercase();
-            if !effort.is_empty() && effort != "auto" && effort != "none" && !has_extra_arg("--reasoning-effort") {
-                command.arg("--reasoning-effort").arg(&profile.reasoning_effort);
-            }
-            if let Some(budget) = profile.reasoning_budget {
-                if budget >= 0 && !has_extra_arg("--reasoning-budget") {
-                    command.arg("--reasoning-budget").arg(budget.to_string());
-                }
-            }
-        }
-        if profile.flash_attention {
-            command.arg("--flash-attn").arg("on");
-        }
-        if profile.ncmoe_layers > 0 {
-            command.arg("-ncmoe").arg(profile.ncmoe_layers.to_string());
-        }
-        if profile.mtp && mtp_draft_path.is_none() {
-            command.arg("--spec-type").arg("draft-mtp");
-        }
-        if profile.mtp || mtp_draft_path.is_some() {
-            command.arg("--spec-draft-n-max").arg(profile.spec_draft_n_max.to_string());
-        }
-        if profile.jinja {
-            command.arg("--jinja");
-        }
-        if !extra_tokens.is_empty() {
-            command.args(&extra_tokens);
-        }
-    }
-    command.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
+/// 基于原始应用图标在右下角像素级合成抗锯齿高光呼吸状态灯（支持黄/绿/红）
+fn create_tray_status_icon(base_icon: &tauri::image::Image, phase: usize, color: TrayLightColor) -> tauri::image::Image<'static> {
+    let width = base_icon.width();
+    let height = base_icon.height();
+    let mut rgba = base_icon.rgba().to_vec();
+
+    if width < 8 || height < 8 {
+        return tauri::image::Image::new_owned(rgba, width, height);
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    emit_log(&app, "system", format!("launch: {} · {} [engine: {}]", model_display_name, profile.name, engine_display_name));
-    let mut child = command.spawn().map_err(|error| {
-        #[cfg(target_os = "linux")]
-        { platform::spawn_error(error) }
-        #[cfg(not(target_os = "linux"))]
-        { format!("启动失败：{error}") }
-    })?;
-    let pid = child.id();
-    if let Some(stdout) = child.stdout.take() {
-        stream_reader(app.clone(), "stdout", stdout);
-    }
-    if let Some(stderr) = child.stderr.take() {
-        stream_reader(app.clone(), "stderr", stderr);
-    }
-    let status = ServerStatus {
-        running: true,
-        pid: Some(pid),
-        port: Some(profile.port),
-        model_id: Some(model.id),
-        model_name: Some(model_display_name.clone()),
-        profile_id: Some(profile.id),
-        profile_name: Some(profile.name),
-        started_at: Some(now_ms()),
-        engine_name: Some(engine_display_name),
-        engine_backend: engine_display_backend,
-        engine_type: Some(engine_type.to_string()),
+    let w_f = width as f32;
+    let h_f = height as f32;
+
+    // 状态点圆心位于右下角
+    let base_r = (w_f * 0.17).max(3.0);
+    let margin = (w_f * 0.06).max(1.5);
+    let cx = w_f - base_r - margin;
+    let cy = h_f - base_r - margin;
+
+    // 4 阶段呼吸光晕节奏：0: 柔暗 -> 1: 渐亮 -> 2: 满亮 -> 3: 渐暗
+    let breathe_factor = match color {
+        TrayLightColor::Red => 0.0,
+        _ => match phase % 4 {
+            0 => 0.25,
+            1 => 0.65,
+            2 => 1.00,
+            _ => 0.65,
+        },
     };
-    {
-        let mut guard = state.0.lock().map_err(|_| "进程状态锁已损坏")?;
-        *guard = Some(ManagedProcess { child, status: status.clone() });
-    }
-    drop(lifecycle);
-    update_tray_status(&app, Some(&model_display_name));
-    Ok(status)
-}
 
-#[tauri::command]
-fn stop_server(app: AppHandle, state: State<ProcessState>) -> Result<ServerStatus, String> {
-    let lifecycle = PROCESS_LIFECYCLE_LOCK.lock().map_err(|_| "进程生命周期锁已损坏")?;
-    let managed = { state.0.lock().map_err(|_| "进程状态锁已损坏")?.take() };
-    if let Some(mut managed) = managed {
-        if let Err(error) = kill_managed_child(&mut managed) {
-            *state.0.lock().map_err(|_| "进程状态锁已损坏")? = Some(managed);
-            return Err(error);
-        }
-        emit_log(&app, "system", "llama-server 已停止");
+    let border_r = base_r + (w_f * 0.04).max(1.0);
+    let halo_r = if color == TrayLightColor::Red {
+        base_r * 1.25
     } else {
-        emit_log(&app, "system", "llama-server 未在运行");
-    }
-    drop(lifecycle);
-    update_tray_status(&app, None);
-    Ok(ServerStatus::default())
-}
-
-#[tauri::command]
-fn get_server_status(state: State<ProcessState>) -> Result<ServerStatus, String> {
-    let mut guard = state.0.lock().map_err(|_| "进程状态锁已损坏")?;
-    if let Some(managed) = guard.as_mut() {
-        if managed_child_exited(managed)? {
-            #[cfg(target_os = "linux")]
-            kill_managed_child(managed)?;
-            *guard = None;
-            Ok(ServerStatus::default())
-        } else {
-            Ok(managed.status.clone())
-        }
-    } else {
-        Ok(ServerStatus::default())
-    }
-}
-
-/// GPU 实时指标（nvidia-smi）：显存 MiB / 核心负载 % / 功耗 W；驱动不支持的字段为 None。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GpuStats {
-    memory_used_mb: Option<f64>,
-    memory_total_mb: Option<f64>,
-    util_percent: Option<f64>,
-    power_watts: Option<f64>,
-}
-
-/// nvidia-smi 成功寻址缓存；Linux 直接检查 PATH 中的可执行文件。
-static SMI_PATH_CACHE: Mutex<Option<PathBuf>> = Mutex::new(None);
-/// 防止 GPU 查询堆积：上一轮还没返回时直接跳过本轮。
-static GPU_QUERY_BUSY: AtomicBool = AtomicBool::new(false);
-
-struct BusyGuard<'a>(&'a AtomicBool);
-impl<'a> BusyGuard<'a> {
-    fn acquire(flag: &'a AtomicBool) -> Option<Self> {
-        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).ok().map(|_| Self(flag))
-    }
-}
-impl Drop for BusyGuard<'_> {
-    fn drop(&mut self) { self.0.store(false, Ordering::Release); }
-}
-
-fn gpu_command_output(command: &mut Command) -> Option<std::process::Output> {
-    #[cfg(target_os = "linux")]
-    { platform::checked_tool(command, None, std::time::Duration::from_secs(2)).ok() }
-    #[cfg(not(target_os = "linux"))]
-    { command.output().ok().filter(|output| output.status.success()) }
-}
-
-fn find_nvidia_smi() -> Option<PathBuf> {
-    let mut cache = SMI_PATH_CACHE.lock().ok()?;
-    if let Some(path) = cache.as_ref() {
-        return Some(path.clone());
-    }
-    // 1) NVIDIA 驱动把 nvidia-smi 随 System32 安装，优先直取（零额外进程）
-    #[cfg(target_os = "linux")]
-    let found = platform::find_in_path("nvidia-smi", std::env::var_os("PATH").as_deref());
-    #[cfg(not(target_os = "linux"))]
-    let found = std::env::var("SystemRoot")
-        .ok()
-        .map(|root| PathBuf::from(root).join(r"system32\nvidia-smi.exe"))
-        .filter(|path| path.exists())
-        // 2) 兜底：PATH 搜索（Windows `where`）
-        .or_else(|| {
-            let mut command = std::process::Command::new("cmd");
-            command.args(["/C", "where", "nvidia-smi"]);
-            // CREATE_NO_WINDOW：GUI 进程拉起控制台程序 cmd 会新建一个可见控制台窗口
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                command.creation_flags(0x08000000);
-            }
-            let output = command.output().ok()?;
-            if !output.status.success() {
-                return None;
-            }
-            String::from_utf8(output.stdout)
-                .ok()?
-                .lines()
-                .map(|line| line.trim())
-                .find(|line| !line.is_empty())
-                .map(PathBuf::from)
-        });
-    *cache = found.clone();
-    found
-}
-
-/// 查询一次 GPU 指标（单位 MiB / % / W）；多卡取第一行即 GPU0。无 NVIDIA 驱动时返回 None。
-fn query_gpu_stats() -> Option<GpuStats> {
-    let _busy = BusyGuard::acquire(&GPU_QUERY_BUSY)?;
-    query_gpu_stats_at(&find_nvidia_smi()?)
-}
-
-fn query_gpu_stats_at(path: &Path) -> Option<GpuStats> {
-    let mut command = std::process::Command::new(&path);
-    command
-        .args([
-            "--query-gpu=memory.total,memory.used,utilization.gpu,power.draw",
-            "--format=csv,noheader,nounits",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    // CREATE_NO_WINDOW：nvidia-smi 是控制台程序，GUI 进程拉起时会闪出控制台窗口（每 2s 轮询一次）
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
-    let output = gpu_command_output(&mut command)?;
-    let text = String::from_utf8(output.stdout).ok()?;
-    let line = text.lines().find(|line| !line.trim().is_empty())?;
-    let fields: Vec<&str> = line.split(',').map(|field| field.trim()).collect();
-    if fields.len() != 4 { return None; }
-    let number = |value: &&str| value.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0);
-    Some(GpuStats {
-        memory_total_mb: fields.first().and_then(number),
-        memory_used_mb: fields.get(1).and_then(number),
-        util_percent: fields.get(2).and_then(number),
-        // 个别卡型不支持功耗读数（输出 "N/A"）→ None，前端回退为仅显示 Idle
-        power_watts: fields.get(3).and_then(number),
-    })
-}
-
-/// 系统级硬件概览：显卡厂商 / 显存 / 总物理内存，供「适配本机」一键边界计算使用。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct HardwareInfo {
-    vendor: String,
-    supported: bool,
-    /// GPU 总显存（MiB；无独显或非 NVIDIA 驱动时为空）
-    vram_total_mb: Option<f64>,
-    /// 可见总物理内存（MiB）；查询失败时为空
-    system_ram_mb: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GpuInfo {
-    vendor: String,
-    supported: bool,
-    /// GPU 总显存（MiB；无独显 / 非 NVIDIA 驱动时为空）
-    vram_total_mb: Option<f64>,
-}
-
-/// 探测显卡厂商 / 显存：NVIDIA 通过 nvidia-smi.exe（System32）并顺带读取总显存，
-/// AMD 通过 atiadlxx.dll（System32）存在性判断，其余视为未知。
-#[tauri::command]
-fn get_gpu_info() -> GpuInfo {
-    #[cfg(target_os = "linux")]
-    let (vendor, supported, vram_total_mb) = match query_gpu_stats().and_then(|stats| stats.memory_total_mb).filter(|v| *v > 0.0) {
-        Some(total) => ("nvidia".to_string(), true, Some(total)),
-        None => ("unknown".to_string(), false, None),
+        base_r * (1.18 + 0.38 * breathe_factor)
     };
-    #[cfg(not(target_os = "linux"))]
-    let (vendor, supported, vram_total_mb) = if find_nvidia_smi().is_some() {
-        (
-            "nvidia".to_string(),
-            true,
-            query_gpu_stats().and_then(|stats| stats.memory_total_mb),
-        )
-    } else if std::env::var("SystemRoot")
-        .ok()
-        .map(|root| PathBuf::from(root).join(r"system32\atiadlxx.dll"))
-        .filter(|p| p.exists())
-        .is_some()
-    {
-        ("amd".to_string(), false, None)
-    } else {
-        ("unknown".to_string(), false, None)
+
+    let min_x = ((cx - halo_r - 2.0).floor().max(0.0)) as u32;
+    let max_x = ((cx + halo_r + 2.0).ceil().min(w_f - 1.0)) as u32;
+    let min_y = ((cy - halo_r - 2.0).floor().max(0.0)) as u32;
+    let max_y = ((cy + halo_r + 2.0).ceil().min(h_f - 1.0)) as u32;
+
+    let (main_rgb, halo_rgb) = match color {
+        TrayLightColor::Green => ((34, 197, 94), (34, 197, 94)),
+        TrayLightColor::Yellow => ((234, 179, 8), (245, 158, 11)),
+        TrayLightColor::Red => ((239, 68, 68), (220, 38, 38)),
     };
-    GpuInfo {
-        vendor,
-        supported,
-        vram_total_mb,
+
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let dx = px - cx;
+            let dy = py - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+
+            let idx = ((y * width + x) * 4) as usize;
+            if idx + 3 >= rgba.len() {
+                continue;
+            }
+
+            // 1. 发光外晕 (Halo)
+            if dist <= halo_r && dist > border_r {
+                let t = (dist - border_r) / (halo_r - border_r);
+                let halo_alpha = if color == TrayLightColor::Red {
+                    (1.0 - t).powi(2) * 0.40
+                } else {
+                    (1.0 - t).powi(2) * (0.30 + 0.50 * breathe_factor)
+                };
+                blend_pixel(&mut rgba[idx..idx + 4], halo_rgb.0, halo_rgb.1, halo_rgb.2, halo_alpha);
+            }
+            // 2. 深色外边框 (Border) 确保对比度
+            else if dist <= border_r && dist > base_r {
+                let t = (dist - base_r) / (border_r - base_r);
+                let border_alpha = 0.85 * (1.0 - t * 0.2);
+                blend_pixel(&mut rgba[idx..idx + 4], 15, 23, 42, border_alpha);
+            }
+            // 3. 核心指示灯点 (Core)
+            else if dist <= base_r {
+                let hx = dx + base_r * 0.25;
+                let hy = dy + base_r * 0.25;
+                let h_dist = (hx * hx + hy * hy).sqrt();
+
+                let (r, g, b) = if h_dist < base_r * 0.45 {
+                    let hl = 1.0 - (h_dist / (base_r * 0.45));
+                    match color {
+                        TrayLightColor::Green => {
+                            let r = (46.0 + 180.0 * hl * (0.6 + 0.4 * breathe_factor)).min(255.0) as u8;
+                            let g = (204.0 + 51.0 * hl).min(255.0) as u8;
+                            let b = (113.0 + 142.0 * hl * (0.6 + 0.4 * breathe_factor)).min(255.0) as u8;
+                            (r, g, b)
+                        }
+                        TrayLightColor::Yellow => {
+                            let r = 255;
+                            let g = (210.0 + 45.0 * hl).min(255.0) as u8;
+                            let b = (100.0 + 155.0 * hl).min(255.0) as u8;
+                            (r, g, b)
+                        }
+                        TrayLightColor::Red => {
+                            let r = (245.0 + 10.0 * hl).min(255.0) as u8;
+                            let g = (80.0 + 140.0 * hl).min(255.0) as u8;
+                            let b = (80.0 + 140.0 * hl).min(255.0) as u8;
+                            (r, g, b)
+                        }
+                    }
+                } else {
+                    match color {
+                        TrayLightColor::Green => {
+                            let base_green = (197.0 + 35.0 * breathe_factor).min(255.0) as u8;
+                            (34, base_green, 94)
+                        }
+                        TrayLightColor::Yellow => {
+                            let base_yellow = (179.0 + 35.0 * breathe_factor).min(214.0) as u8;
+                            (234, base_yellow, 8)
+                        }
+                        TrayLightColor::Red => (main_rgb.0, main_rgb.1, main_rgb.2),
+                    }
+                };
+                blend_pixel(&mut rgba[idx..idx + 4], r, g, b, 1.0);
+            }
+        }
     }
+
+    tauri::image::Image::new_owned(rgba, width, height)
 }
 
-#[tauri::command]
-async fn get_gpu_stats() -> Result<Option<GpuStats>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        query_gpu_stats()
-    })
-    .await
-    .map_err(|_| "GPU 查询任务已中断".into())
-}
-
-#[cfg(windows)]
-fn total_system_memory_mb() -> Option<f64> {
-    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-
-    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
-    if ok == 0 {
-        return None;
+fn blend_pixel(dst: &mut [u8], src_r: u8, src_g: u8, src_b: u8, src_alpha: f32) {
+    if src_alpha <= 0.0 {
+        return;
     }
-    let total_kb = status.ullTotalPhys / 1024;
-    Some(total_kb as f64 / 1024.0)
-}
-
-#[cfg(target_os = "linux")]
-fn total_system_memory_mb() -> Option<f64> {
-    platform::memory_from_meminfo(&fs::read_to_string("/proc/meminfo").ok()?)
-}
-#[cfg(not(any(windows, target_os = "linux")))]
-fn total_system_memory_mb() -> Option<f64> { None }
-
-/// 汇总本机硬件能力：显卡 / 显存 + 总物理内存（供「适配本机」一键边界计算）。
-#[tauri::command]
-fn hardware_info() -> HardwareInfo {
-    let system_ram_mb = total_system_memory_mb();
-    let info = get_gpu_info();
-    let vram_total_mb = info.supported.then_some(info.vram_total_mb).flatten();
-    HardwareInfo {
-        vendor: info.vendor,
-        supported: info.supported,
-        vram_total_mb,
-        system_ram_mb,
+    let sa = src_alpha.min(1.0);
+    let da = (dst[3] as f32) / 255.0;
+    let out_a = sa + da * (1.0 - sa);
+    if out_a <= 0.0 {
+        return;
     }
+
+    let dr = dst[0] as f32;
+    let dg = dst[1] as f32;
+    let db = dst[2] as f32;
+
+    let sr = src_r as f32;
+    let sg = src_g as f32;
+    let sb = src_b as f32;
+
+    let out_r = (sr * sa + dr * da * (1.0 - sa)) / out_a;
+    let out_g = (sg * sa + dg * da * (1.0 - sa)) / out_a;
+    let out_b = (sb * sa + db * da * (1.0 - sa)) / out_a;
+
+    dst[0] = out_r.round().clamp(0.0, 255.0) as u8;
+    dst[1] = out_g.round().clamp(0.0, 255.0) as u8;
+    dst[2] = out_b.round().clamp(0.0, 255.0) as u8;
+    dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PickedFile {
-    path: String,
-    size_bytes: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DiskUsage {
-    path: String,
-    total_bytes: u64,
-    free_bytes: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AppUpdateInfo {
-    status: String,
-    latest_tag: String,
-    release_url: String,
-    release_notes: Option<String>,
-    asset_url: Option<String>,
-    asset_name: Option<String>,
-    asset_size: Option<u64>,
-    asset_sha256: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    install_kind: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    install_supported: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    install_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AppInstallResult {
-    status: String,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    backup_path: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct HuggingFaceModel {
-    id: String,
-    author: String,
-    name: String,
-    downloads: u64,
-    likes: u64,
-    updated_at: String,
-    tags: Vec<String>,
-    /// 已有 .gguf 文件总数（-1 表示未查询）
-    gguf_count: i64,
-    /// 供列表页展示的推荐量化文件名（可能为空）
-    sample_quant: Option<String>,
-    /// 从模型名/标签解析出的参数量（十亿单位；解析失败为 None）
-    parameters_b: Option<f64>,
-    /// 从量化标签解析出的比特位（如 Q4_K_M → 4、IQ3_M → 3；无法识别为 None）
-    quant_bits: Option<i32>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct HuggingFaceFile {
-    name: String,
-    size_bytes: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct HfDownloadResult {
     path: String,
     size_bytes: u64,
 }
@@ -1822,22 +680,6 @@ fn paths_exist(paths: Vec<String>) -> Vec<String> {
     paths.into_iter().filter(|path| !path.trim().is_empty() && Path::new(path).exists()).collect()
 }
 
-/// 智能识别引擎架构类型：llamacpp | ninfer | ninfer_kvmem
-fn detect_engine_type(path: &str) -> &'static str {
-    let lower = path.to_lowercase();
-    let name = Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_lowercase())
-        .unwrap_or_else(|| lower.clone());
-    if name.contains("ninfer") && (name.contains("kvmem") || lower.contains("kvmem")) {
-        "ninfer_kvmem"
-    } else if name.starts_with("ninfer") || name.contains("ninfer") {
-        "ninfer"
-    } else {
-        "llamacpp"
-    }
-}
-
 fn extract_parameters_from_name(name: &str) -> String {
     let bytes = name.as_bytes();
     let len = bytes.len();
@@ -1872,7 +714,7 @@ fn extract_quant_from_name(name: &str) -> String {
         "q5_k_s", "q5_k_m", "q5_k", "q5_0", "q5_1",
         "q6_k", "q8_0", "q8_k",
         "fp16", "f16", "bf16", "fp32", "f32",
-        "rk8v4", "k8v4", "nvfp4", "int8", "int4", "gsq"
+        "rk8v4", "rk4v4-e8", "rk4v4_e8", "rk4v4", "rk2v4-e8", "rk2v4_e8", "k8v4", "nvfp4", "fp8", "int8", "int4", "gsq"
     ];
     for &q in QUANTS {
         if let Some(pos) = lower.find(q) {
@@ -1969,7 +811,8 @@ fn inspect_gguf(path: String) -> GgufMeta {
 
 #[cfg(test)]
 mod gguf_meta_tests {
-    use super::{detect_engine_type, read_gguf_meta, read_ninfer_meta};
+    use crate::engines::detect_engine_type;
+    use super::{read_gguf_meta, read_ninfer_meta};
 
     #[test]
     fn detect_engine_type_identifies_engines() {
@@ -2041,60 +884,47 @@ mod gguf_meta_tests {
         assert_eq!(meta.quantization, "Q8_0");
         let _ = std::fs::remove_file(path);
     }
+
+    #[test]
+    fn test_ensure_device_profile_schema_conversion() {
+        use crate::server_args::ensure_device_profile_schema;
+        let path = std::env::temp_dir().join("test-device-profile-schema.json");
+        let initial_json = r#"{
+  "schema": "ninfer.device-route-profiles",
+  "schema_version": 1,
+  "devices": [
+    {
+      "hardware_class": "nvidia-geforce-rtx-5070-ti-sm120",
+      "routes": { "route1": "kernel_a" }
+    }
+  ]
+}"#;
+        std::fs::write(&path, initial_json).unwrap();
+
+        // Convert 1 -> 2 (for kvmem)
+        ensure_device_profile_schema(&path, 2);
+        let content_v2 = std::fs::read_to_string(&path).unwrap();
+        let parsed_v2: serde_json::Value = serde_json::from_str(&content_v2).unwrap();
+        assert_eq!(parsed_v2["schema_version"], 2);
+        assert_eq!(parsed_v2["devices"][0]["routes"]["route1"], "kernel_a");
+
+        // Convert 2 -> 1 (for standard ninfer)
+        ensure_device_profile_schema(&path, 1);
+        let content_v1 = std::fs::read_to_string(&path).unwrap();
+        let parsed_v1: serde_json::Value = serde_json::from_str(&content_v1).unwrap();
+        assert_eq!(parsed_v1["schema_version"], 1);
+        assert_eq!(parsed_v1["devices"][0]["routes"]["route1"], "kernel_a");
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ConfigBackupFile {
-    kind: String,
-    version: u32,
-    exported_at: u64,
-    config: AppConfig,
-}
-
-/// 导出当前配置。默认去掉 Hugging Face Token，避免明文令牌跟着备份文件传播。
+/// 弹出系统目录选择框并返回所选路径（取消时返回 None）
 #[tauri::command]
-fn export_config_backup(app: AppHandle) -> Result<String, String> {
-    let mut config = read_config(&app)?;
-    config.hf_token = None;
-    let backup = ConfigBackupFile {
-        kind: "cookllm-config".into(),
-        version: 1,
-        exported_at: now_ms(),
-        config,
-    };
-    let contents = serde_json::to_vec_pretty(&backup).map_err(|error| error.to_string())?;
-    let file_name = format!("CookLLM-config-{}.json", backup.exported_at);
-    let Some(target) = app.dialog().file().set_file_name(&file_name).add_filter("CookLLM 配置", &["json"]).blocking_save_file() else {
-        return Ok(String::new());
-    };
-    let Some(path) = target.as_path() else {
-        return Err("无法写入所选路径".into());
-    };
-    fs::write(path, contents).map_err(|error| error.to_string())?;
-    Ok(path.to_string_lossy().to_string())
-}
-
-/// 读取一份备份。只校验信封，真正合并由前端按当前模型库决定，避免覆盖用户刚改的配置。
-#[tauri::command]
-fn pick_config_backup(app: AppHandle) -> Result<Option<AppConfig>, String> {
-    let Some(file_path) = app.dialog().file().add_filter("CookLLM 配置", &["json"]).blocking_pick_file() else {
-        return Ok(None);
-    };
-    let Some(path) = file_path.as_path() else {
-        return Err("无法读取所选文件".into());
-    };
-    let contents = fs::read_to_string(path).map_err(|error| error.to_string())?;
-    let value: serde_json::Value = serde_json::from_str(&contents).map_err(|error| format!("配置文件不是有效 JSON：{}", error))?;
-    let config_value = if value.get("kind").and_then(|item| item.as_str()) == Some("cookllm-config") {
-        value.get("config").cloned().ok_or_else(|| "配置备份缺少 config 字段".to_string())?
-    } else if value.get("models").is_some() || value.get("serverPath").is_some() {
-        value
-    } else {
-        return Err("这不是 CookLLM 配置备份".into());
-    };
-    let config: AppConfig = serde_json::from_value(config_value).map_err(|error| format!("配置备份无法识别：{}", error))?;
-    Ok(Some(config))
+fn pick_directory(app: AppHandle) -> Option<String> {
+    let folder = app.dialog().file().blocking_pick_folder()?;
+    let path = folder.as_path()?;
+    Some(path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -2165,406 +995,6 @@ fn pick_folder(app: AppHandle) -> Vec<PickedFile> {
     out
 }
 
-/// 把 root 下所有 *.dll 文件复制到 bin_dir（与 llama-server.exe 同级），供 CUDA/Vulkan 运行时使用。
-/// 覆盖 cudart 包可能把 dll 放在子目录的情况（如 lib/ 或 bin/x64/）。
-fn flatten_dlls(root: &Path, bin_dir: &Path) {
-    let Ok(entries) = fs::read_dir(root) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            flatten_dlls(&path, bin_dir);
-        } else if path.extension().map(|ext| ext.eq_ignore_ascii_case("dll")).unwrap_or(false) {
-            let name = path.file_name().unwrap_or_default();
-            let dest = bin_dir.join(name);
-            if !dest.exists() {
-                let _ = fs::copy(&path, &dest);
-            }
-        }
-    }
-}
-
-/// 从文件名或路径文本中提取 CUDA 完整版本（如 "12.4"、"13.4"、"11.8"、"13.2.86"）
-fn extract_cuda_full_version(lower: &str) -> String {
-    // 1. 扫描所有 "cuda" 出现位置（跳过 "cudart" 自身）
-    let mut search_from = 0;
-    while let Some(pos) = lower[search_from..].find("cuda") {
-        let abs_pos = search_from + pos;
-        search_from = abs_pos + 4;
-        let after = &lower[abs_pos + 4..];
-        if after.starts_with("rt") {
-            continue;
-        }
-        let mut rest = after.trim_start_matches(|c| c == '-' || c == '_' || c == ' ');
-        if rest.starts_with("cu") {
-            rest = rest[2..].trim_start_matches(|c| c == '-' || c == '_');
-        }
-        if rest.starts_with(|c: char| c.is_ascii_digit()) {
-            let mut out = String::new();
-            for c in rest.chars() {
-                if c.is_ascii_digit() || (c == '.' && !out.is_empty() && !out.ends_with('.')) {
-                    out.push(c);
-                } else {
-                    break;
-                }
-            }
-            while out.ends_with('.') {
-                out.pop();
-            }
-            if !out.is_empty() {
-                return out;
-            }
-        }
-    }
-
-    // 2. 扫描所有单独的 "cu" 后面直接跟数字（如 "cu12.4", "cu118", "cu12"）
-    let mut search_from = 0;
-    while let Some(pos) = lower[search_from..].find("cu") {
-        let abs_pos = search_from + pos;
-        search_from = abs_pos + 2;
-        if lower[abs_pos..].starts_with("cuda") || lower[abs_pos..].starts_with("cudart") {
-            continue;
-        }
-        let rest = lower[abs_pos + 2..].trim_start_matches(|c| c == '-' || c == '_');
-        if rest.starts_with(|c: char| c.is_ascii_digit()) {
-            let mut out = String::new();
-            for c in rest.chars() {
-                if c.is_ascii_digit() || (c == '.' && !out.is_empty() && !out.ends_with('.')) {
-                    out.push(c);
-                } else {
-                    break;
-                }
-            }
-            while out.ends_with('.') {
-                out.pop();
-            }
-            if !out.is_empty() {
-                return out;
-            }
-        }
-    }
-
-    String::new()
-}
-
-/// 提取 CUDA 主版本号（如 "12"、"13"、"11"）
-fn extract_cuda_major_version(full_or_text: &str) -> String {
-    let trimmed = full_or_text.trim();
-    if trimmed.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
-        trimmed.split('.').next().unwrap_or("").to_string()
-    } else {
-        let full = extract_cuda_full_version(&trimmed.to_lowercase());
-        full.split('.').next().unwrap_or("").to_string()
-    }
-}
-
-/// 判断安装目录是否已包含指定主版本的 CUDA 运行时 dll（如 cudart64_12.dll / cublas64_12.dll）。
-fn has_cuda_runtime_dll(dir: &Path, major: &str) -> bool {
-    for name in [format!("cudart64_{}.dll", major), format!("cublas64_{}.dll", major), format!("cublasLt64_{}.dll", major)] {
-        if dir.join(&name).is_file() {
-            return true;
-        }
-    }
-    if major == "11" && dir.join("cudart64_110.dll").is_file() {
-        return true;
-    }
-    false
-}
-
-/// 判断安装目录是否具备指定主版本且完整的 CUDA 运行时（cudart 与 cublas 均就绪且未损坏）
-fn is_cuda_runtime_complete(dir: &Path, major: &str) -> bool {
-    if major.is_empty() {
-        return false;
-    }
-    let has_cudart = dir.join(format!("cudart64_{}.dll", major)).is_file()
-        || (major == "11" && dir.join("cudart64_110.dll").is_file());
-    let has_cublas = dir.join(format!("cublas64_{}.dll", major)).is_file()
-        || dir.join(format!("cublasLt64_{}.dll", major)).is_file();
-    has_cudart && has_cublas
-}
-
-/// 获取指定目录下的 CUDA 版本（如 "12.4"、"13.4"、"12"）
-fn get_installed_cuda_version(dir: &Path) -> Option<String> {
-    if let Ok(text) = fs::read_to_string(dir.join("cuda_version.txt")) {
-        let v = text.trim();
-        if !v.is_empty() {
-            return Some(v.to_string());
-        }
-    }
-    let path_text = dir.to_string_lossy().to_lowercase();
-    let from_path = extract_cuda_full_version(&path_text);
-    if !from_path.is_empty() {
-        return Some(from_path);
-    }
-    for major in ["13", "12", "11"] {
-        if is_cuda_runtime_complete(dir, major) {
-            return Some(major.to_string());
-        }
-    }
-    for major in ["13", "12", "11"] {
-        if has_cuda_runtime_dll(dir, major) {
-            return Some(major.to_string());
-        }
-    }
-    None
-}
-
-/// 在目录树中查找可执行文件：当前目录优先，其次按子目录就近递归，深度上限 6。
-fn find_executable(dir: &Path, exe_name: &str, depth: usize) -> Option<PathBuf> {
-    let entries: Vec<_> = fs::read_dir(dir).ok()?.flatten().collect();
-    let current = entries.iter().find(|entry| {
-        if !entry.path().is_file() { return false; }
-        #[cfg(target_os = "linux")]
-        if platform::validate_engine(&entry.path()).is_err() { return false; }
-        let file_name = entry.file_name();
-        let name = file_name.to_string_lossy();
-        if cfg!(windows) {
-            name.eq_ignore_ascii_case(exe_name)
-        } else {
-            name == exe_name
-        }
-    }).map(|entry| entry.path());
-    if let Some(found) = current {
-        return Some(found);
-    }
-    if depth >= 6 {
-        return None;
-    }
-    for entry in entries {
-        let path = entry.path();
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            if let Some(found) = find_executable(&path, exe_name, depth + 1) {
-                return Some(found);
-            }
-        }
-    }
-    None
-}
-
-/// 智能探测目录树中的 server 可执行文件（如 llama-server.exe、llama-kvmem-server.exe 等）
-fn find_server_executable(dir: &Path, depth: usize) -> Option<PathBuf> {
-    let default_name = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
-    // 1) 优先查找官方标准名
-    if let Some(standard) = find_executable(dir, default_name, depth) {
-        return Some(standard);
-    }
-    // 2) 就近模糊匹配带 server 的分支可执行程序
-    find_server_fuzzy(dir, depth)
-}
-
-fn server_file_is_executable(path: &Path, name: &str) -> bool {
-    #[cfg(target_os = "linux")]
-    { let _ = name; platform::validate_engine(path).is_ok() }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = path;
-        if cfg!(windows) { name.ends_with(".exe") } else { !name.contains('.') || name.ends_with(".bin") }
-    }
-}
-
-fn find_server_fuzzy(dir: &Path, depth: usize) -> Option<PathBuf> {
-    let entries: Vec<_> = fs::read_dir(dir).ok()?.flatten().collect();
-    let mut candidate_llama_server = None;
-    let mut candidate_any_server = None;
-
-    for entry in &entries {
-        let path = entry.path();
-        if path.is_file() {
-            let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-            let is_exe = server_file_is_executable(&path, &name);
-            if is_exe {
-                // 排除 RPC 节点服务与工具
-                if name.contains("rpc") || name.contains("test") || name.contains("bench") || name.contains("quantize") || name.contains("cli") {
-                    continue;
-                }
-                if (name.starts_with("llama") && name.contains("server")) || name.starts_with("ninfer") {
-                    candidate_llama_server = Some(path);
-                    break;
-                } else if (name.contains("server") || name.contains("serve")) && candidate_any_server.is_none() {
-                    candidate_any_server = Some(path);
-                }
-            }
-        }
-    }
-    if let Some(found) = candidate_llama_server.or(candidate_any_server) {
-        return Some(found);
-    }
-
-    if depth >= 6 {
-        return None;
-    }
-    for entry in entries {
-        let path = entry.path();
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            if let Some(found) = find_server_fuzzy(&path, depth + 1) {
-                return Some(found);
-            }
-        }
-    }
-    None
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ServerCandidate {
-    name: String,
-    path: String,
-    rel_path: String,
-    size_bytes: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PickServerResult {
-    status: String, // "selected" | "multiple" | "none" | "cancelled"
-    candidates: Vec<ServerCandidate>,
-    selected_path: Option<String>,
-}
-
-fn collect_server_candidates(root: &Path, dir: &Path, depth: usize, out: &mut Vec<ServerCandidate>) {
-    let Ok(entries) = fs::read_dir(dir) else { return; };
-    let mut subdirs = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() {
-            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let name_lower = name.to_lowercase();
-            let is_exe = server_file_is_executable(&path, &name_lower);
-            if is_exe {
-                // 必须明确排除 RPC 节点服务（如 ggml-rpc-server.exe）、命令行客户端、量化/基准测试等非 LLM API 服务
-                if name_lower.contains("rpc")
-                    || name_lower.contains("test")
-                    || name_lower.contains("bench")
-                    || name_lower.contains("quantize")
-                    || name_lower.contains("cli")
-                    || name_lower.contains("simple")
-                {
-                    continue;
-                }
-                let is_server = name_lower == "llama-server.exe"
-                    || name_lower == "llama-server"
-                    || (name_lower.starts_with("llama") && name_lower.contains("server"))
-                    || (name_lower.contains("llama") && name_lower.contains("server"))
-                    || (name_lower.ends_with("-server.exe") || name_lower.ends_with("_server.exe"))
-                    || name_lower == "ninfer-serve.exe"
-                    || name_lower == "ninfer-serve"
-                    || (name_lower.starts_with("ninfer") && (name_lower.contains("serve") || name_lower.contains("server")));
-                if is_server {
-                    let rel_path = path.strip_prefix(root)
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|_| name.clone());
-                    let size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    out.push(ServerCandidate {
-                        name,
-                        path: path.to_string_lossy().to_string(),
-                        rel_path,
-                        size_bytes,
-                    });
-                }
-            }
-        } else if path.is_dir() && depth < 6 {
-            subdirs.push(path);
-        }
-    }
-    for sub in subdirs {
-        collect_server_candidates(root, &sub, depth + 1, out);
-    }
-}
-
-/// 选择本机 llama.cpp 构建或安装目录，智能定位或返回多个候选程序。
-#[tauri::command]
-fn pick_server_dir(app: AppHandle) -> Result<PickServerResult, String> {
-    let Some(file_path) = app.dialog().file().blocking_pick_folder() else {
-        return Ok(PickServerResult {
-            status: "cancelled".into(),
-            candidates: Vec::new(),
-            selected_path: None,
-        });
-    };
-    let Some(folder) = file_path.as_path() else {
-        return Ok(PickServerResult {
-            status: "cancelled".into(),
-            candidates: Vec::new(),
-            selected_path: None,
-        });
-    };
-
-    let mut candidates = Vec::new();
-    collect_server_candidates(folder, folder, 0, &mut candidates);
-
-    if candidates.is_empty() {
-        return Ok(PickServerResult {
-            status: "none".into(),
-            candidates: Vec::new(),
-            selected_path: None,
-        });
-    }
-
-    // 排序策略：
-    // 1. 官方标准名 llama-server.exe / llama-server 绝对优先；
-    // 2. 相对路径浅优先（根目录下的优先于深层子目录 / 副本）；
-    // 3. 字典序
-    candidates.sort_by(|a, b| {
-        let is_std_a = a.name.eq_ignore_ascii_case("llama-server.exe") || a.name == "llama-server";
-        let is_std_b = b.name.eq_ignore_ascii_case("llama-server.exe") || b.name == "llama-server";
-        if is_std_a != is_std_b {
-            return if is_std_a { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
-        }
-        let depth_a = a.rel_path.split(['/', '\\']).count();
-        let depth_b = b.rel_path.split(['/', '\\']).count();
-        depth_a.cmp(&depth_b).then_with(|| a.name.cmp(&b.name))
-    });
-
-    // 统计有多少种【不同名称】的 Server 程序
-    let distinct_names: std::collections::HashSet<_> = candidates
-        .iter()
-        .map(|c| path_dedupe_key(&c.name))
-        .collect();
-
-    // 若所有候选文件的程序名称相同（例如只有原版 llama-server.exe，或工程根目录与 build/ 产物重名）：
-    // 自动选取最优的一个（最浅层/标准名），零弹窗直接应用！
-    if distinct_names.len() <= 1 {
-        let path = candidates[0].path.clone();
-        Ok(PickServerResult {
-            status: "selected".into(),
-            candidates,
-            selected_path: Some(path),
-        })
-    } else {
-        // 确实存在多种不同名称的分支程序（如 llama-server.exe 与 llama-kvmem-server.exe 并存）：
-        // 此时按程序名去重，仅为每种分支保留最优的一条候选供用户点选
-        let mut seen = std::collections::HashSet::new();
-        let mut unique_candidates = Vec::new();
-        for c in candidates {
-            if seen.insert(path_dedupe_key(&c.name)) {
-                unique_candidates.push(c);
-            }
-        }
-        Ok(PickServerResult {
-            status: "multiple".into(),
-            candidates: unique_candidates,
-            selected_path: None,
-        })
-    }
-}
-
-/// 直接选择具体的 server 可执行文件（如 llama-server.exe、llama-kvmem-server.exe 等）。
-/// 用户取消时返回空串。
-#[tauri::command]
-fn pick_server_file(app: AppHandle) -> Result<String, String> {
-    let builder = app.dialog().file();
-    #[cfg(windows)]
-    let builder = builder.add_filter("可执行程序 (*.exe)", &["exe"]);
-    let Some(file_path) = builder.blocking_pick_file() else {
-        return Ok(String::new());
-    };
-    let Some(path) = file_path.as_path() else {
-        return Ok(String::new());
-    };
-    #[cfg(target_os = "linux")]
-    platform::validate_engine(path)?;
-    Ok(path.to_string_lossy().to_string())
-}
-
 /// 把前端拖入/选中的路径展开为模型文件列表（支持 .gguf 与 .ninfer）：目录递归收集，文件按后缀过滤，最后按路径去重。
 /// 供“拖拽上传区”使用——拖入的文件/文件夹路径直接来自 Tauri 的 drag-drop 事件。
 #[tauri::command]
@@ -2588,7 +1018,7 @@ fn expand_paths(paths: Vec<String>) -> Vec<PickedFile> {
     dedup_gguf(raw)
 }
 
-fn path_dedupe_key(path: &str) -> String {
+pub(crate) fn path_dedupe_key(path: &str) -> String {
     // Windows 文件系统大小写不敏感，按小写去重避免同一文件被识别为两条
     #[cfg(windows)]
     { path.to_lowercase() }
@@ -2956,15 +1386,270 @@ fn configure_main_window(app: &mut tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+/// 关闭窗口是否最小化到托盘：Linux 无系统托盘兜底时默认直接退出，
+/// 仅在托盘确实存在时才隐藏窗口，避免窗口被隐藏后无法唤回。
 fn should_hide_on_close(preference: Option<bool>, tray_available: bool) -> bool {
     preference.unwrap_or(!cfg!(target_os = "linux")) && tray_available
 }
 
+fn build_tray_menu(app: &AppHandle, tray_state: &TrayServerState) -> tauri::Result<Menu<tauri::Wry>> {
+    let menu = Menu::new(app)?;
+
+    let config = read_config(app).ok();
+    let models = config.as_ref().map(|c| c.models.as_slice()).unwrap_or_default();
+
+    let get_format_tag = |name: &str| -> &'static str {
+        models
+            .iter()
+            .find(|m| {
+                let dname = m
+                    .display_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(m.name.as_str());
+                dname == name || m.name == name
+            })
+            .map(|m| {
+                let is_ninfer = m.path.to_lowercase().ends_with(".ninfer")
+                    || m.architecture.to_uppercase() == "NINFER";
+                if is_ninfer { "[Ninfer] " } else { "[GGUF] " }
+            })
+            .unwrap_or("")
+    };
+
+    // 1. 服务状态项与控制项（仅在启动中、运行中或失败时显示；未运行/停止时保持干净，与刚打开软件时完全一致，无多余任务状态行）
+    match tray_state {
+        TrayServerState::Starting { model_name, port } => {
+            let tag = get_format_tag(model_name);
+            let status_text = format!("🟡 启动中: {}{} (端口: {})", tag, model_name, port);
+            let status_item = MenuItem::with_id(app, "status_label", &status_text, true, None::<&str>)?;
+            menu.append(&status_item)?;
+
+            let sep_status = PredefinedMenuItem::separator(app)?;
+            menu.append(&sep_status)?;
+
+            let stop_item = MenuItem::with_id(app, "stop_service", "⏹ 取消启动", true, None::<&str>)?;
+            menu.append(&stop_item)?;
+
+            let copy_item = MenuItem::with_id(app, "copy_endpoint", "📋 复制 API 接口", true, None::<&str>)?;
+            menu.append(&copy_item)?;
+
+            let sep_ctrl = PredefinedMenuItem::separator(app)?;
+            menu.append(&sep_ctrl)?;
+        }
+        TrayServerState::Running { model_name, port } => {
+            let tag = get_format_tag(model_name);
+            let status_text = format!("🟢 运行中: {}{} (端口: {})", tag, model_name, port);
+            let status_item = MenuItem::with_id(app, "status_label", &status_text, true, None::<&str>)?;
+            menu.append(&status_item)?;
+
+            let sep_status = PredefinedMenuItem::separator(app)?;
+            menu.append(&sep_status)?;
+
+            let stop_item = MenuItem::with_id(app, "stop_service", "⏹ 停止服务", true, None::<&str>)?;
+            menu.append(&stop_item)?;
+
+            let webui_item = MenuItem::with_id(app, "open_webui", "🌐 打开会话界面 (WebUI)", true, None::<&str>)?;
+            menu.append(&webui_item)?;
+
+            let copy_item = MenuItem::with_id(app, "copy_endpoint", "📋 复制 API 接口", true, None::<&str>)?;
+            menu.append(&copy_item)?;
+
+            let sep_ctrl = PredefinedMenuItem::separator(app)?;
+            menu.append(&sep_ctrl)?;
+        }
+        TrayServerState::Failed { model_name, .. } => {
+            let status_text = format!("🔴 启动失败: {} (点击查看详情)", model_name);
+            let status_item = MenuItem::with_id(app, "view_error", &status_text, true, None::<&str>)?;
+            menu.append(&status_item)?;
+
+            let sep_status = PredefinedMenuItem::separator(app)?;
+            menu.append(&sep_status)?;
+        }
+        TrayServerState::Stopped => {
+            // 未运行时不显示任何服务状态项，与刚打开软件时完全一致
+        }
+    }
+
+    // 3. 模型子菜单：处于启动中或运行中时传达“切换”语义
+    let is_active = matches!(tray_state, TrayServerState::Starting { .. } | TrayServerState::Running { .. });
+    let current_model_name = match tray_state {
+        TrayServerState::Starting { model_name, .. } | TrayServerState::Running { model_name, .. } => Some(model_name.as_str()),
+        _ => None,
+    };
+
+    let submenu_title = if is_active { "▶ 切换模型" } else { "▶ 启动模型" };
+    let model_submenu = Submenu::new(app, submenu_title, true)?;
+
+    if models.is_empty() {
+        let empty_item = MenuItem::with_id(app, "no_models", "暂无可用模型 (请先导入)", false, None::<&str>)?;
+        model_submenu.append(&empty_item)?;
+    } else {
+        if is_active {
+            let switch_hint = MenuItem::with_id(app, "switch_hint", "💡 点击将先停止当前服务", false, None::<&str>)?;
+            model_submenu.append(&switch_hint)?;
+            let hint_sep = PredefinedMenuItem::separator(app)?;
+            model_submenu.append(&hint_sep)?;
+        }
+
+        for model in models {
+            let display_name = model
+                .display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(model.name.as_str());
+            let is_ninfer = model.path.to_lowercase().ends_with(".ninfer")
+                || model.architecture.to_uppercase() == "NINFER";
+            let format_tag = if is_ninfer { "[Ninfer]" } else { "[GGUF]" };
+            let is_current = current_model_name.map(|cur| cur == display_name || cur == model.name).unwrap_or(false);
+            let label = if is_current {
+                format!("✓ {} {}", format_tag, display_name)
+            } else {
+                format!("{} {}", format_tag, display_name)
+            };
+            let item_id = format!("start_model:{}", model.id);
+            let item = MenuItem::with_id(app, &item_id, &label, !is_current, None::<&str>)?;
+            model_submenu.append(&item)?;
+        }
+    }
+    menu.append(&model_submenu)?;
+
+    let sep2 = PredefinedMenuItem::separator(app)?;
+    menu.append(&sep2)?;
+
+    // 4. 窗口控制
+    let show_item = MenuItem::with_id(app, "show", "显示界面", true, None::<&str>)?;
+    menu.append(&show_item)?;
+
+    let sep3 = PredefinedMenuItem::separator(app)?;
+    menu.append(&sep3)?;
+
+    // 5. 退出
+    let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    menu.append(&quit_item)?;
+
+    Ok(menu)
+}
+
+/// 唤起主窗口的统一入口：显示 + 还原最小化 + 聚焦，并确保窗口落在当前可见屏幕内。
+///
+/// Windows 在显示器拓扑变化（拔插外接屏、改分辨率/DPI、睡眠唤醒、远程桌面）时只搬移
+/// 可见窗口，隐藏中的窗口仍停留在旧坐标——从托盘 show() 后任务栏出现图标但屏幕上
+/// 看不到主窗口，只能杀进程重开。这里在显示后校验窗口与现有显示器的可见重叠，
+/// 不足时强制居中到最近的可见显示器，彻底规避该类问题。
+fn show_window_onscreen(window: &tauri::WebviewWindow) {
+    let _ = window.show();
+    if window.is_minimized().unwrap_or(false) {
+        let _ = window.unminimize();
+    }
+    let _ = window.set_focus();
+
+    // 与任一显示器的可见重叠都小于一条可拖拽的边条（96x40 物理像素）时判定"不可见"，
+    // 交由 center() 落回最近的显示器。center() 会以窗口当前所属（最近的）显示器为基准。
+    let pos = window.outer_position().ok();
+    let size = window.outer_size().ok();
+    let monitors = window.available_monitors().ok();
+    if let (Some(pos), Some(size), Some(monitors)) = (pos, size, monitors) {
+        const MIN_VISIBLE_W: i32 = 96;
+        const MIN_VISIBLE_H: i32 = 40;
+        let enough = monitors.iter().any(|m| {
+            let mp = m.position();
+            let ms = m.size();
+            let overlap_w = (pos.x + size.width as i32).min(mp.x + ms.width as i32) - pos.x.max(mp.x);
+            let overlap_h = (pos.y + size.height as i32).min(mp.y + ms.height as i32) - pos.y.max(mp.y);
+            overlap_w >= MIN_VISIBLE_W && overlap_h >= MIN_VISIBLE_H
+        });
+        if !enough {
+            let _ = window.center();
+        }
+    }
+}
+
+fn handle_tray_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
+    let id = event.id.as_ref();
+    match id {
+        "show" | "status_label" => {
+            if let Some(window) = app.get_webview_window("main") {
+                show_window_onscreen(&window);
+            }
+        }
+        "stop_service" => {
+            let state = app.state::<ProcessState>();
+            let _ = stop_server_internal(app, &state);
+        }
+        "open_webui" => {
+            let state = app.state::<ProcessState>();
+            let port = {
+                let guard = state.0.lock().ok();
+                guard.and_then(|g| g.as_ref().and_then(|m| m.status.port)).unwrap_or(8080)
+            };
+            let _ = open_url(app.clone(), format!("http://127.0.0.1:{}", port));
+        }
+        "copy_endpoint" => {
+            let port = match get_tray_state() {
+                TrayServerState::Starting { port, .. } | TrayServerState::Running { port, .. } => port,
+                _ => {
+                    let state = app.state::<ProcessState>();
+                    let guard = state.0.lock().ok();
+                    guard.and_then(|g| g.as_ref().and_then(|m| m.status.port)).unwrap_or(8080)
+                }
+            };
+            let endpoint = format!("http://127.0.0.1:{}/v1", port);
+            if let Err(e) = set_system_clipboard(&endpoint) {
+                emit_log(app, "stderr", &format!("复制 API 接口失败: {}", e));
+            } else {
+                emit_log(app, "system", &format!("已复制 API 接口到剪贴板: {}", endpoint));
+                if let Some(tray) = app.tray_by_id("main-tray") {
+                    let _ = tray.set_tooltip(Some(format!("已复制 API 接口: {}", endpoint)));
+                }
+            }
+        }
+        "view_error" => {
+            if let Some(window) = app.get_webview_window("main") {
+                show_window_onscreen(&window);
+            }
+            let error_msg = if let TrayServerState::Failed { error, .. } = get_tray_state() {
+                error
+            } else {
+                String::new()
+            };
+            let _ = app.emit("tray_view_error", error_msg);
+        }
+        "quit" => {
+            app.exit(0);
+        }
+        s if s.starts_with("start_model:") => {
+            let model_id = &s["start_model:".len()..];
+            if let Ok(config) = read_config(app) {
+                if let Some(model) = config.models.iter().find(|m| m.id == model_id) {
+                    let profile_id = if config.preferred_model_id.as_deref() == Some(model_id) && config.preferred_profile_id.is_some() {
+                        config.preferred_profile_id.clone().unwrap()
+                    } else if let Some(p) = model.profiles.first() {
+                        p.id.clone()
+                    } else if let Some(p) = config.profiles.first() {
+                        p.id.clone()
+                    } else {
+                        String::new()
+                    };
+                    if !profile_id.is_empty() {
+                        let state = app.state::<ProcessState>();
+                        if let Err(err) = start_server_internal(app, &state, model_id, &profile_id) {
+                            emit_log(app, "stderr", &format!("托盘启动服务失败: {}", err));
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
-    let show_item = MenuItem::with_id(app, "show", "显示 CookLLM", true, None::<&str>)?;
-    let separator = PredefinedMenuItem::separator(app)?;
-    let quit_item = MenuItem::with_id(app, "quit", "退出 CookLLM", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show_item, &separator, &quit_item])?;
+    let handle = app.handle().clone();
+    let tray_state = get_tray_state();
+    let menu = build_tray_menu(&handle, &tray_state)?;
 
     let icon = app.default_window_icon().cloned();
 
@@ -2973,19 +1658,7 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| {
-            match event.id.as_ref() {
-                "show" => {
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.unminimize();
-                        let _ = window.set_focus();
-                    }
-                }
-                "quit" => {
-                    app.exit(0);
-                }
-                _ => {}
-            }
+            handle_tray_menu_event(app, event);
         })
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {
@@ -2996,12 +1669,14 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
             {
                 let app = tray.app_handle();
                 if let Some(window) = app.get_webview_window("main") {
-                    if window.is_visible().unwrap_or(false) {
+                    // 最小化状态下 is_visible() 也为 true：优先还原而不是隐藏，
+                    // 同时避免产生"隐藏且最小化"的叠加态（该状态下还原容易出边角问题）。
+                    if window.is_minimized().unwrap_or(false) {
+                        show_window_onscreen(&window);
+                    } else if window.is_visible().unwrap_or(false) {
                         let _ = window.hide();
                     } else {
-                        let _ = window.show();
-                        let _ = window.unminimize();
-                        let _ = window.set_focus();
+                        show_window_onscreen(&window);
                     }
                 }
             }
@@ -3016,2504 +1691,194 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+/* ==================== 全局快捷键自定义功能 ==================== */
 
-/* ==================== 阶段四：社区探索（HuggingFace 热门 / 搜索 / 下载） ==================== */
-
-const HF_API_BASE: &str = "https://huggingface.co/api";
-const HF_DL_BASE: &str = "https://huggingface.co";
-
-fn hf_repo_id(repo: &str) -> String {
-    repo.trim().trim_end_matches('/').to_string()
+#[derive(Default, Clone)]
+struct RegisteredShortcuts {
+    toggle_window: Option<Shortcut>,
+    start_server: Option<Shortcut>,
+    stop_server: Option<Shortcut>,
+    switch_engine: Option<Shortcut>,
 }
 
-/// 仓库名转安全目录名（社区探索下载的本地根目录名）。
-fn hf_repo_dir_name(repo: &str) -> String {
-    let id = hf_repo_id(repo);
-    let last = id.rsplit('/').next().unwrap_or(&id);
-    let sanitized: String = last
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
-        .collect();
-    if sanitized.is_empty() { "model".into() } else { sanitized }
+static REGISTERED_SHORTCUTS: OnceLock<Mutex<RegisteredShortcuts>> = OnceLock::new();
+
+fn get_registered_shortcuts() -> &'static Mutex<RegisteredShortcuts> {
+    REGISTERED_SHORTCUTS.get_or_init(|| Mutex::new(RegisteredShortcuts::default()))
 }
 
-/// 直连客户端（忽略系统/手动代理）：当代理路径连接失败时降级重试，兼容浏览器侧 TUN/Clash 透明代理。
-fn direct_client() -> &'static reqwest::blocking::Client {
-    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::blocking::Client::builder()
-            .user_agent(HF_UA)
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .no_proxy()
-            .build()
-            .expect("构建直连网络客户端失败")
-    })
-}
-
-const HF_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-
-/// 带标准浏览器 UA 的 HF 请求
-fn hf_send(client: &reqwest::blocking::Client, url: &str) -> Result<reqwest::blocking::Response, reqwest::Error> {
-    client
-        .get(url)
-        .header("user-agent", HF_UA)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-}
-
-/// 处理 HF 响应：状态码检查 + JSON 解析
-fn hf_response_json(response: reqwest::blocking::Response) -> Result<serde_json::Value, String> {
-    if !response.status().is_success() {
-        let code = response.status().as_u16();
-        let message = match code {
-            429 => "HuggingFace API 触发限流（HTTP 429），请稍后重试".to_string(),
-            403 => "HuggingFace API 拒绝访问（HTTP 403）".to_string(),
-            _ => format!("HuggingFace API 返回 HTTP {}", code),
+fn resolve_default_model_and_profile(config: &AppConfig) -> Option<(String, String)> {
+    if let Some(ref model_id) = config.preferred_model_id {
+        if let Some(model) = config.models.iter().find(|m| &m.id == model_id) {
+            let profile_id = if let Some(ref pid) = config.preferred_profile_id {
+                pid.clone()
+            } else if let Some(p) = model.profiles.first() {
+                p.id.clone()
+            } else if let Some(p) = config.profiles.first() {
+                p.id.clone()
+            } else {
+                String::new()
+            };
+            if !profile_id.is_empty() {
+                return Some((model.id.clone(), profile_id));
+            }
+        }
+    }
+    for model in &config.models {
+        let profile_id = if let Some(p) = model.profiles.first() {
+            p.id.clone()
+        } else if let Some(p) = config.profiles.first() {
+            p.id.clone()
+        } else {
+            String::new()
         };
-        return Err(message);
-    }
-    response.json().map_err(|error| format!("解析 HuggingFace API 响应失败：{}", error))
-}
-
-/// 探测本机正在监听的代理端口（Clash 7897 / Clash 7890 / V2rayN 10809 等），返回可用地址。
-/// 结果缓存 60 秒：本机代理端口在一次会话内几乎不变，而每次全量探测最坏 8×150ms，
-/// 该函数被 fetch/download/avatar 等高频兜底链路反复调用。
-fn probe_local_proxy() -> Option<String> {
-    use std::net::{SocketAddr, TcpStream};
-    use std::sync::atomic::AtomicU64;
-    use std::time::Duration;
-    const PORTS: &[u16] = &[7897, 7890, 7891, 10809, 10808, 1080, 8888, 2080];
-    const PROBE_TIMEOUT_MS: u64 = 150;
-    const CACHE_TTL_MS: u64 = 60_000;
-    struct ProbeCache {
-        at_ms: AtomicU64,
-        value: Mutex<Option<Option<String>>>,
-    }
-    static CACHE: OnceLock<ProbeCache> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| ProbeCache { at_ms: AtomicU64::new(0), value: Mutex::new(None) });
-    let now = now_ms();
-    let cached = cache.value.lock().ok().and_then(|guard| guard.as_ref().cloned()).filter(|_| {
-        now.saturating_sub(cache.at_ms.load(Ordering::Relaxed)) < CACHE_TTL_MS
-    });
-    if let Some(value) = cached {
-        return value;
-    }
-    let fresh = PORTS.iter().find_map(|port| {
-        let address = SocketAddr::from(([127, 0, 0, 1], *port));
-        TcpStream::connect_timeout(&address, Duration::from_millis(PROBE_TIMEOUT_MS)).is_ok().then(|| format!("http://127.0.0.1:{}", port))
-    });
-    if let Ok(mut guard) = cache.value.lock() {
-        *guard = Some(fresh.clone());
-        cache.at_ms.store(now, Ordering::Relaxed);
-    }
-    fresh
-}
-
-/// 带指定代理地址的客户端
-fn proxied_client(proxy_url: &str) -> Result<reqwest::blocking::Client, String> {
-    let proxy = reqwest::Proxy::all(proxy_url).map_err(|error| format!("代理地址无效：{}", error))?;
-    reqwest::blocking::Client::builder()
-        .user_agent(HF_UA)
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .proxy(proxy)
-        .build()
-        .map_err(|error| format!("初始化代理客户端失败：{}", error))
-}
-
-/// 把 huggingface.co 替换为国内镜像 hf-mirror.com
-fn hf_mirror_url(url: &str) -> Option<String> {
-    if url.contains("huggingface.co") {
-        Some(url.replace("huggingface.co", "hf-mirror.com"))
-    } else {
-        None
-    }
-}
-
-/// 通用多通道兜底（原四处逐行复制的通道切换逻辑）：配置代理 → 直连 → 本机探测代理端口 →
-/// mirror=true 时追加 hf-mirror 镜像通道。`attempt` 为单通道尝试（url 参数已按通道替换为镜像地址）；
-/// 返回第一个成功的通道结果，全部失败时返回各通道的错误明细，由调用方拼接最终提示文案。
-fn with_net_fallback<T>(
-    config_client: &reqwest::blocking::Client,
-    url: &str,
-    mirror: bool,
-    mut attempt: impl FnMut(&reqwest::blocking::Client, &str) -> Result<T, String>,
-) -> Result<T, Vec<String>> {
-    let mut errors: Vec<String> = Vec::new();
-    match attempt(config_client, url) {
-        Ok(value) => return Ok(value),
-        Err(error) => errors.push(format!("配置代理通道：{}", error)),
-    }
-    match attempt(direct_client(), url) {
-        Ok(value) => return Ok(value),
-        Err(error) => errors.push(format!("直连：{}", error)),
-    }
-    if let Some(proxy_url) = probe_local_proxy() {
-        match proxied_client(&proxy_url) {
-            Ok(proxied) => match attempt(&proxied, url) {
-                Ok(value) => return Ok(value),
-                Err(error) => errors.push(format!("本地代理 {}：{}", proxy_url, error)),
-            },
-            Err(error) => errors.push(format!("初始化本地代理 {} 失败：{}", proxy_url, error)),
-        }
-    } else {
-        errors.push("未探测到本机代理端口".into());
-    }
-    if mirror {
-        if let Some(mirror_url) = hf_mirror_url(url) {
-            match attempt(direct_client(), &mirror_url) {
-                Ok(value) => return Ok(value),
-                Err(error) => errors.push(format!("镜像 hf-mirror.com：{}", error)),
-            }
-        }
-    }
-    Err(errors)
-}
-
-/// 查询 HF API：多通道自动兜底（配置代理 → 直连 → 本机代理端口 → hf-mirror 镜像）
-fn fetch_hf_json(client: &reqwest::blocking::Client, url: &str) -> Result<serde_json::Value, String> {
-    with_net_fallback(client, url, true, |client, url| {
-        hf_response_json(hf_send(client, url).map_err(|error| error.to_string())?)
-    })
-    .map_err(|errors| format!("HuggingFace 连接失败（{}）。请在「设置 → 网络与代理」选择手动代理（Clash 端口 7897 / V2rayN 10809）后重试", errors.join("；")))
-}
-
-/// 拉取候选模型并按量化位过滤（服务端二次过滤：HF filter 不支持按 bit 查询）。
-/// 有量化过滤时放大 limit，循环翻页直到凑满目标数量或 API 返回空，保证分页语义正确。
-fn fetch_models_filtered(client: &reqwest::blocking::Client, base: &str, format_filter: Option<&str>, limit: usize, skip: Option<usize>, quants: Option<Vec<i32>>) -> Result<Vec<HuggingFaceModel>, String> {
-    let wanted = limit;
-    if let Some(bits) = quants {
-        if !bits.is_empty() {
-            let mut seen = std::collections::HashSet::new();
-            let mut collected: Vec<HuggingFaceModel> = Vec::new();
-            let mut cursor = skip.unwrap_or(0);
-            let page = (wanted * 4).clamp(50, 100);
-            // 最多 20 页，避免极端情况死循环
-            for _ in 0..20 {
-                let mut url = format!("{}&limit={}&skip={}", base, page, cursor);
-                match format_filter {
-                    Some("gguf") => url.push_str("&filter=gguf"),
-                    Some("ninfer") => url.push_str("&filter=ninfer"),
-                    _ => {}
-                }
-                let value = fetch_hf_json(client, &url)?;
-                let items = value.as_array().ok_or("HuggingFace API 返回格式异常")?;
-                let mut any = false;
-                for value in items {
-                    if let Some(model) = hf_model_from_value(value) {
-                        any = true;
-                        if let Some(bits_b) = model.quant_bits {
-                            if bits.contains(&bits_b) && seen.insert(model.id.clone()) {
-                                collected.push(model);
-                                if collected.len() >= wanted {
-                                    return Ok(collected);
-                                }
-                            }
-                        }
-                    }
-                }
-                if !any || items.len() < page {
-                    break;
-                }
-                cursor += page;
-            }
-            return Ok(collected);
-        }
-    }
-    // 无量化过滤：原有单页逻辑
-    let mut url = format!("{}&limit={}", base, wanted);
-    if let Some(page_skip) = skip {
-        url.push_str(&format!("&skip={}", page_skip));
-    }
-    match format_filter {
-        Some("gguf") => url.push_str("&filter=gguf"),
-        Some("ninfer") => url.push_str("&filter=ninfer"),
-        _ => {}
-    }
-    let value = fetch_hf_json(client, &url)?;
-    let items = value.as_array().ok_or("HuggingFace API 返回格式异常")?;
-    Ok(items.iter().filter_map(hf_model_from_value).collect::<Vec<_>>())
-}
-
-fn hf_model_from_value(value: &serde_json::Value) -> Option<HuggingFaceModel> {
-    let id = value.get("id").and_then(|value| value.as_str())?.to_string();
-    if id.is_empty() {
-        return None;
-    }
-    let author = id.split('/').next().unwrap_or("").to_string();
-    let name = value
-        .get("modelId")
-        .and_then(|value| value.as_str())
-        .or_else(|| value.get("id").and_then(|value| value.as_str()))
-        .unwrap_or(&id)
-        .to_string();
-    let tags: Vec<String> = value
-        .get("tags")
-        .and_then(|value| value.as_array())
-        .map(|items| items.iter().filter_map(|tag| tag.as_str().map(String::from)).collect())
-        .unwrap_or_default();
-    let gated = value
-        .get("gated")
-        .map(|value| match value {
-            serde_json::Value::Bool(flag) => *flag,
-            serde_json::Value::String(text) => text != "false",
-            _ => false,
-        })
-        .unwrap_or(false);
-    let sample_quant = tags
-        .iter()
-        .find(|tag| tag.to_lowercase().contains(".gguf") || tag.to_lowercase().contains(".ninfer"))
-        .cloned()
-        .or_else(|| {
-            ["Q4_K_M", "Q5_K_M", "Q8_0", "Q6_K", "Q4_0", "NVFP4", "RK8V4", "INT8", "BF16"]
-                .iter()
-                .find(|candidate| tags.iter().any(|tag| tag.to_uppercase().contains(**candidate)))
-                .map(|value| value.to_string())
-        });
-    // 参数量：优先取形如 0.5B / 7B / 14B / 32B / 70B 的数字（名称或标签中最靠前的匹配）。
-    let parameter_sources = std::iter::once(id.clone())
-        .chain(tags.iter().cloned())
-        .collect::<Vec<_>>();
-    let parameters_b = parameter_sources
-        .iter()
-        .filter_map(|text| {
-            regex_like_parameter(text).or_else(|| {
-                // 兜底：把 "14b-instruct" 等小写串也纳入匹配
-                regex_like_parameter(&text.to_lowercase())
-            })
-        })
-        .next();
-    // 量化比特位：从 id / 标签 / 推荐量化名中提取 Q 数字（IQ3 → 3、Q4_K_M → 4、Q8_0 → 8）。
-    let quant_bits = parameter_sources
-        .iter()
-        .chain(std::iter::once(&sample_quant.clone().unwrap_or_default()))
-        .filter_map(|text| {
-            let upper = text.to_uppercase();
-            for token in upper.split(|c: char| !c.is_ascii_alphanumeric()) {
-                if token.starts_with('Q') && token.len() > 1 {
-                    if let Ok(digits) = token[1..].chars().take(2).collect::<String>().parse::<i32>() {
-                        if (1..=8).contains(&digits) {
-                            return Some(digits);
-                        }
-                    }
-                }
-                if let Some(rest) = token.strip_prefix("IQ") {
-                    if let Ok(digits) = rest.chars().take(1).collect::<String>().parse::<i32>() {
-                        if (1..=8).contains(&digits) {
-                            return Some(digits);
-                        }
-                    }
-                }
-                // 1-bit 与 16-bit/原版：HF 标签可写为 F16/BF16/FP16/FP32/F32。
-                if matches!(token, "F16" | "BF16" | "FP16" | "FP32" | "F32") {
-                    return Some(16);
-                }
-            }
-            None
-        })
-        .next()
-        .or_else(|| sample_quant.as_deref().and_then(|quant| {
-            quant.to_uppercase().chars().find(|c| *c != 'I' && *c != 'Q')
-                .and_then(|c| c.to_digit(10))
-                .map(|digit| digit as i32)
-        }));
-    Some(HuggingFaceModel {
-        id,
-        author,
-        name,
-        downloads: value.get("downloads").and_then(|value| value.as_u64()).unwrap_or(0),
-        likes: value.get("likes").and_then(|value| value.as_u64()).unwrap_or(0),
-        updated_at: value.get("lastModified").and_then(|value| value.as_str()).unwrap_or("").to_string(),
-        tags,
-        gguf_count: -1,
-        sample_quant: if gated { None } else { sample_quant },
-        parameters_b,
-        quant_bits,
-    })
-}
-
-/// 从文本中提取参数量（十亿）：匹配 "7b"、"14b"、"0.5b"、"32b" 等；返回最先出现且 <= 1000B 的值。
-fn regex_like_parameter(text: &str) -> Option<f64> {
-    let lower = text.to_lowercase();
-    let bytes = lower.as_bytes();
-    let mut start: Option<usize> = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b.is_ascii_digit() || b == b'.' {
-            if start.is_none() {
-                start = Some(i);
-            }
-        } else {
-            // 'b' 紧跟数字串尾部时视为参数量（"7b" / "0.5b"）；
-            // 其余字符一律重置数字起点（"2.5-14b" 应命中 14 而非报错）。
-            if b == b'b' {
-                if let Some(from) = start {
-                    let candidate = &lower[from..i];
-                    if let Ok(value) = candidate.parse::<f64>() {
-                        if value > 0.0 && value <= 1000.0 {
-                            return Some(value);
-                        }
-                    }
-                }
-            }
-            start = None;
-        }
-        i += 1;
-    }
-    None
-}
-
-/// 本周 HuggingFace 热门模型（sort=trending）；支持格式筛选（全部 / 仅 GGUF / 仅 NINFER）。
-#[tauri::command]
-async fn hf_trending(app: AppHandle, limit: Option<usize>, gguf_only: Option<bool>, format_filter: Option<String>, skip: Option<usize>, sort: Option<String>, quants: Option<Vec<i32>>) -> Result<Vec<HuggingFaceModel>, String> {
-    let config = read_config(&app)?;
-    let network = config.network.clone().unwrap_or_default();
-    tauri::async_runtime::spawn_blocking(move || {
-        let client = build_net_client(&network)?;
-        let base = format!("{}/models?sort=trendingScore&direction=-1&expand[]=lastModified&expand[]=downloads&expand[]=likes", HF_API_BASE);
-        let base = if let Some(sort_by) = sort {
-            base.replace("sort=trendingScore", &format!("sort={}", sort_by))
-        } else {
-            base
-        };
-        let effective_filter = format_filter.as_deref().or_else(|| {
-            if gguf_only.unwrap_or(false) { Some("gguf") } else { None }
-        });
-        fetch_models_filtered(&client, &base, effective_filter, limit.unwrap_or(12), skip, quants)
-    })
-    .await
-    .map_err(|error| format!("获取热门榜单任务中断：{}", error))?
-}
-
-/// 搜索 HuggingFace 模型（关键词 / 组织名）；支持格式筛选。
-#[tauri::command]
-async fn hf_search(app: AppHandle, query: String, limit: Option<usize>, gguf_only: Option<bool>, format_filter: Option<String>, skip: Option<usize>, sort: Option<String>, quants: Option<Vec<i32>>) -> Result<Vec<HuggingFaceModel>, String> {
-    let config = read_config(&app)?;
-    let network = config.network.clone().unwrap_or_default();
-    tauri::async_runtime::spawn_blocking(move || {
-        let client = build_net_client(&network)?;
-        let effective_filter = format_filter.as_deref().or_else(|| {
-            if gguf_only.unwrap_or(false) { Some("gguf") } else { None }
-        });
-        let mut url = reqwest::Url::parse(&format!("{}/models", HF_API_BASE)).map_err(|error| format!("构建请求 URL 失败：{}", error))?;
-        let search_text = query.trim();
-        let effective_search = if search_text.is_empty() && effective_filter == Some("ninfer") {
-            "ninfer"
-        } else {
-            search_text
-        };
-        if !effective_search.is_empty() {
-            url.query_pairs_mut().append_pair("search", effective_search);
-        }
-        url.query_pairs_mut()
-            .append_pair("sort", sort.as_deref().unwrap_or("trendingScore"))
-            .append_pair("expand[]", "lastModified")
-            .append_pair("expand[]", "downloads")
-            .append_pair("expand[]", "likes")
-            .append_pair("direction", "-1");
-        let base = url.as_str().to_string();
-        fetch_models_filtered(&client, &base, effective_filter, limit.unwrap_or(30), skip, quants)
-    })
-    .await
-    .map_err(|error| format!("搜索任务中断：{}", error))?
-}
-
-/// 列出仓库 main 分支的 .gguf 与 .ninfer 模型文件（递归，按文件名排序）。
-#[tauri::command]
-async fn hf_list_files(app: AppHandle, repo: String) -> Result<Vec<HuggingFaceFile>, String> {
-    let config = read_config(&app)?;
-    let network = config.network.clone().unwrap_or_default();
-    tauri::async_runtime::spawn_blocking(move || {
-        let client = build_net_client(&network)?;
-        let base = hf_repo_id(&repo);
-        let url = format!("{}/models/{}/tree/main?recursive=true&expand=false", HF_API_BASE, base);
-        let value = fetch_hf_json(&client, &url)?;
-        let items = value.as_array().ok_or("HuggingFace API 返回格式异常")?;
-        let mut files: Vec<HuggingFaceFile> = items
-            .iter()
-            .filter_map(|item| {
-                let kind = item.get("type").and_then(|value| value.as_str()).unwrap_or("");
-                if kind != "file" {
-                    return None;
-                }
-                let name = item.get("path").and_then(|value| value.as_str())?;
-                let lower = name.to_lowercase();
-                if !lower.ends_with(".gguf") && !lower.ends_with(".ninfer") {
-                    return None;
-                }
-                let size = item.get("size").and_then(|value| value.as_u64()).unwrap_or(0);
-                Some(HuggingFaceFile { name: name.to_string(), size_bytes: size })
-            })
-            .collect();
-        files.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(files)
-    })
-    .await
-    .map_err(|error| format!("获取文件列表任务中断：{}", error))?
-}
-
-/// 计算目标下载路径并防目录逃逸（仅允许文件名中的普通路径段）。
-fn model_download_dest(root: &Path, repo: &str, file: &str) -> Result<PathBuf, String> {
-    use std::path::Component;
-    let repo_dir = root.join(hf_repo_dir_name(repo));
-    let mut out = repo_dir.clone();
-    for component in Path::new(file).components() {
-        match component {
-            Component::Normal(segment) => out.push(segment),
-            _ => return Err(format!("文件名包含非法路径：{}", file)),
-        }
-    }
-    if !out.starts_with(&repo_dir) {
-        return Err("非法下载路径".into());
-    }
-    Ok(out)
-}
-
-/// 单个下载任务的独立控制器：取消 / 暂停标志按任务隔离（每个 taskId 一份），
-/// 不再使用进程级全局标志，避免「取消一个任务 = 全部取消 / 全部暂停」的串扰。
-#[derive(Default)]
-struct DownloadTaskControl {
-    cancel: AtomicBool,
-    pause: AtomicBool,
-}
-
-/// 下载任务注册表：taskId -> 任务控制器。
-/// 前端每次发起下载携带唯一 taskId；取消 / 暂停 / 删除只操作自己那把控制器，
-/// 同时多个下载任务可并行推进互不干扰。
-#[derive(Clone, Default)]
-struct DownloadRegistry(Arc<Mutex<HashMap<String, Arc<DownloadTaskControl>>>>);
-
-impl DownloadRegistry {
-    /// 注册（或重置）一个任务控制器，返回该任务的 Arc 引用。
-    fn register(&self, task_id: &str) -> Arc<DownloadTaskControl> {
-        let slot = Arc::new(DownloadTaskControl::default());
-        if let Ok(mut guard) = self.0.lock() {
-            guard.insert(task_id.to_string(), slot.clone());
-        }
-        slot
-    }
-
-    /// 按 taskId 取控制器；不存在（任务已结束 / 未注册）返回 None。
-    fn slot(&self, task_id: &str) -> Option<Arc<DownloadTaskControl>> {
-        self.0.lock().ok()?.get(task_id).cloned()
-    }
-
-    /// 校验 controller 仍是该 taskId 当前注册的控制器。
-    /// 用于下载循环自检：若自己已被新一轮下载接管（register 覆盖）或被摘除（unregister），
-    /// 说明自己已成孤儿循环，应立即退出，否则暂停 / 取消永远送不到它手上。
-    #[cfg(not(target_os = "linux"))]
-    fn is_current(&self, task_id: &str, controller: &Arc<DownloadTaskControl>) -> bool {
-        self.0.lock().ok()
-            .and_then(|guard| guard.get(task_id).map(|slot| Arc::ptr_eq(slot, controller)))
-            .unwrap_or(false)
-    }
-
-    /// 摘除控制器，但仅当注册表里的仍是 controller 本人时才摘。
-    /// 无条件的 unregister 在「新循环接管旧循环」时会误删新循环的控制器，让它变成新的孤儿。
-    fn unregister_if_current(&self, task_id: &str, controller: &Arc<DownloadTaskControl>) {
-        if let Ok(mut guard) = self.0.lock() {
-            if guard.get(task_id).map(|slot| Arc::ptr_eq(slot, controller)).unwrap_or(false) {
-                guard.remove(task_id);
-            }
-        }
-    }
-
-    /// 移除任务控制器（下载循环结束 / 前端删除任务后调用）。
-    fn unregister(&self, task_id: &str) {
-        if let Ok(mut guard) = self.0.lock() {
-            guard.remove(task_id);
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ModelDownloadProgress {
-    task_id: String,
-    repo: String,
-    file: String,
-    phase: String,
-    percent: u32,
-    downloaded: u64,
-    total: u64,
-    speed_bps: u64,
-    message: String,
-}
-
-fn emit_model_progress(app: &AppHandle, task_id: &str, repo: &str, file: &str, phase: &str, percent: u32, downloaded: u64, total: u64, speed: u64, message: impl Into<String>) {
-    let _ = app.emit("model-download-progress", ModelDownloadProgress {
-        task_id: task_id.into(),
-        repo: repo.into(),
-        file: file.into(),
-        phase: phase.into(),
-        percent: percent.min(100),
-        downloaded,
-        total,
-        speed_bps: speed,
-        message: message.into(),
-    });
-}
-
-/// 取消指定下载任务：仅中止该 taskId 对应的下载循环，不影响其他任务。
-#[tauri::command]
-fn hf_cancel_download(state: State<DownloadRegistry>, task_id: String) -> Result<(), String> {
-    if let Some(slot) = state.slot(&task_id) {
-        slot.cancel.store(true, Ordering::Relaxed);
-        slot.pause.store(false, Ordering::Relaxed);
-    }
-    Ok(())
-}
-
-/// 暂停指定下载任务（保留 .part 断点文件，前端「继续」时重新发起并断点续传），仅影响该 taskId。
-#[tauri::command]
-fn hf_pause_download(state: State<DownloadRegistry>, task_id: String) -> Result<(), String> {
-    if let Some(slot) = state.slot(&task_id) {
-        slot.pause.store(true, Ordering::Relaxed);
-    }
-    Ok(())
-}
-
-/// 清除 / 摘除指定任务的控制器（前端重新发起下载或删除任务时调用，防止残留标志影响下一轮）。
-#[tauri::command]
-fn hf_clear_download(state: State<DownloadRegistry>, task_id: String) -> Result<(), String> {
-    state.unregister(&task_id);
-    Ok(())
-}
-
-/// 删除本地文件（下载管理中「取消任务并删除缓存」用）。
-/// 出于防御只允许删除模型库目录内的目标，拒绝任意路径的删除请求。
-#[tauri::command]
-fn remove_local_file(app: AppHandle, path: String) -> Result<(), String> {
-    if path.is_empty() { return Err("文件路径为空".into()); }
-    #[cfg(target_os = "linux")]
-    {
-        let config = read_config(&app)?;
-        let root = models_root(&app, &config)?;
-        linux_model_download::remove_local_file(&root, Path::new(&path))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let target = PathBuf::from(path.trim());
-        if !target.exists() { return Ok(()); }
-        let config = read_config(&app)?;
-        let root = models_root(&app, &config)?;
-        let canonical_target = target.canonicalize().map_err(|error| error.to_string())?;
-        let canonical_root = root.canonicalize().unwrap_or(root);
-        if !canonical_target.starts_with(&canonical_root) {
-            return Err(format!("拒绝删除模型库目录之外的路径：{}", path));
-        }
-        if target.is_dir() {
-            fs::remove_dir_all(&target).map_err(|error| format!("删除目录失败：{}", error))
-        } else {
-            fs::remove_file(&target).map_err(|error| format!("删除文件失败：{}", error))
-        }
-    }
-}
-
-/// 在系统资源管理器中定位并选中文件（文件不存在时打开其所在目录）。
-#[tauri::command]
-fn reveal_in_folder(path: String) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    { platform::reveal_path(Path::new(&path), std::env::var_os("PATH").as_deref()) }
-    #[cfg(not(target_os = "linux"))]
-    {
-    let target = PathBuf::from(path.trim());
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        let args = if target.is_dir() {
-            vec![target.to_string_lossy().to_string()]
-        } else if target.exists() {
-            vec!["/select,".to_string(), target.to_string_lossy().to_string()]
-        } else if let Some(parent) = target.parent().filter(|dir| dir.exists()) {
-            vec![parent.to_string_lossy().to_string()]
-        } else {
-            return Err(format!("路径不存在：{}", path));
-        };
-        std::process::Command::new("explorer")
-            .args(&args)
-            .creation_flags(0x08000000)
-            .spawn()
-            .map_err(|error| format!("打开资源管理器失败：{}", error))?;
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = target;
-        Err("该功能仅支持 Windows 和 Linux".into())
-    }
-    #[cfg(target_os = "windows")]
-    { Ok(()) }
-    }
-}
-
-#[cfg(target_os = "linux")]
-mod linux_model_download;
-
-/// 下载 HF 文件：多通道自动兜底（配置代理 → 直连 → 本地探测代理 → hf-mirror 镜像）。
-/// 返回 (客户端, 实际 URL, 是否已降级)。
-#[cfg(not(target_os = "linux"))]
-fn download_hf_with_fallback(config_client: &reqwest::blocking::Client, url: &str) -> Result<(reqwest::blocking::Client, String), String> {
-    // 只要某通道连接成功（含 4xx 授权类）就返回该通道；由调用者处理状态码
-    let attempt = |client: &reqwest::blocking::Client, url: &str| -> Result<(reqwest::blocking::Client, String), String> {
-        let response = client
-            .get(url)
-            .header("user-agent", HF_UA)
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
-            .map_err(|error| error.to_string())?;
-        drop(response);
-        Ok((client.clone(), url.to_string()))
-    };
-    with_net_fallback(config_client, url, true, attempt)
-        .map_err(|_| "无法访问 HuggingFace（配置代理 / 直连 / 本地代理 / hf-mirror 镜像均失败）".to_string())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn hf_partial_path(dest: &Path) -> PathBuf {
-    let mut name = dest.as_os_str().to_os_string();
-    name.push(".part");
-    PathBuf::from(name)
-}
-
-/// 判断下载 URL 是否属于 HuggingFace（官方站或 hf-mirror 镜像），决定是否附加 Token。
-#[cfg(not(target_os = "linux"))]
-fn is_hf_url(url: &str) -> bool {
-    url.starts_with(HF_DL_BASE) || url.contains("hf-mirror.com")
-}
-
-/// 验证 Hugging Face Token（/whoami-v2），成功返回绑定的用户名。
-#[tauri::command]
-async fn hf_whoami(app: AppHandle, token: String) -> Result<String, String> {
-    let config = read_config(&app)?;
-    let network = config.network.clone().unwrap_or_default();
-    tauri::async_runtime::spawn_blocking(move || verify_hf_token(build_net_client(&network)?, token))
-        .await
-        .map_err(|error| format!("验证任务中断：{}", error))?
-}
-
-/// 多通道自动兜底验证 HF Token（配置代理 → 直连 → 本地探测代理 → hf-mirror 镜像），与 fetch_hf_json 的通道顺序一致。
-fn verify_hf_token(config_client: reqwest::blocking::Client, token: String) -> Result<String, String> {
-    let url = format!("{}/whoami-v2", HF_API_BASE);
-    // 任一通道到达服务端（含 4xx 授权类）即视为通道成功并返回确定性结果；仅连接失败才降级到下一通道
-    let outcome = with_net_fallback::<Result<String, String>>(&config_client, &url, true, |client, url| {
-        hf_token_once(client, url, &token).ok_or_else(|| "连接失败".to_string())
-    });
-    match outcome {
-        Ok(result) => result,
-        Err(errors) => Err(format!(
-            "无法连接 HuggingFace（{}）。请在「设置 → 网络与代理」选择手动代理后重试",
-            errors.join("；")
-        )),
-    }
-}
-
-/// 在指定通道发送一次 whoami-v2 验证请求：到达响应（含 4xx 授权类）返回 Some(最终结果)，连接失败返回 None。
-fn hf_token_once(client: &reqwest::blocking::Client, url: &str, token: &str) -> Option<Result<String, String>> {
-    let response = client
-        .get(url)
-        .header("user-agent", HF_UA)
-        .bearer_auth(token.trim())
-        .timeout(std::time::Duration::from_secs(15))
-        .send()
-        .ok()?;
-    if !response.status().is_success() {
-        return Some(Err(format!("Token 无效或已过期（HTTP {}）", response.status().as_u16())));
-    }
-    let json: serde_json::Value = match response.json() {
-        Ok(value) => value,
-        Err(error) => return Some(Err(format!("解析响应失败：{}", error))),
-    };
-    let name = json.get("name").and_then(|value| value.as_str()).unwrap_or("").to_string();
-    if name.is_empty() {
-        return Some(Err("未能在响应中解析出用户名".into()));
-    }
-    Some(Ok(name))
-}
-
-/* ==================== HF 作者头像（社区探索模型 logo） ==================== */
-
-/// 作者头像会话级内存缓存：author -> data URI；None 表示已尝试但不可用（本会话不再重试）。
-fn avatar_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// 标准 base64（RFC 4648，含填充）：仅用于头像 data URI，避免为此引入新依赖。
-fn base64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let triple = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let bits = ((triple[0] as u32) << 16) | ((triple[1] as u32) << 8) | triple[2] as u32;
-        out.push(TABLE[(bits >> 18) as usize & 63] as char);
-        out.push(TABLE[(bits >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { TABLE[(bits >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[bits as usize & 63] as char } else { '=' });
-    }
-    out
-}
-
-/// 单通道解析作者头像的 CDN 地址：先按组织查询，404 再按用户查询。
-/// mirror=true 时把 huggingface.co 替换为 hf-mirror.com（cdn-avatars 子域同样有镜像）。
-fn hf_resolve_avatar_url(client: &reqwest::blocking::Client, author: &str, mirror: bool) -> Result<String, String> {
-    for kind in ["organizations", "users"] {
-        let url = format!("{}/{}/{}/avatar", HF_API_BASE, kind, author);
-        let target = if mirror { hf_mirror_url(&url).unwrap_or(url) } else { url };
-        if let Ok(response) = hf_send(client, &target) {
-            if !response.status().is_success() {
-                continue; // 404：该作者不属于此类身份，换下一种再试
-            }
-            if let Ok(value) = response.json::<serde_json::Value>() {
-                if let Some(avatar) = value.get("avatarUrl").and_then(|v| v.as_str()) {
-                    if !avatar.is_empty() {
-                        return Ok(avatar.to_string());
-                    }
-                }
-            }
-        }
-    }
-    Err("该作者没有公开头像".into())
-}
-
-/// 经通道下载头像图片，返回 (MIME, 字节)；非图片响应或超过 2MB 视为失败。
-fn hf_fetch_avatar_image(client: &reqwest::blocking::Client, url: &str, mirror: bool) -> Result<(String, Vec<u8>), String> {
-    let target = if mirror { hf_mirror_url(url).unwrap_or_else(|| url.to_string()) } else { url.to_string() };
-    let response = hf_send(client, &target).map_err(|error| error.to_string())?;
-    let status = response.status();
-    let mime = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if !status.is_success() {
-        return Err(format!("HTTP {}", status.as_u16()));
-    }
-    if !mime.starts_with("image/") {
-        return Err(format!("响应不是图片（{}）", if mime.is_empty() { "未知类型" } else { &mime }));
-    }
-    let bytes = response.bytes().map_err(|error| error.to_string())?;
-    if bytes.len() > 2 * 1024 * 1024 {
-        return Err("头像文件超过 2MB".into());
-    }
-    Ok((mime, bytes.to_vec()))
-}
-
-/// 获取 HuggingFace 作者（组织 / 用户）头像并转为 data URI 返回，前端 <img> 直接渲染。
-/// 复用模型列表的四通道兜底（配置代理 → 直连 → 本地代理 → hf-mirror 镜像）；
-/// 按作者缓存，拉不到时返回 Ok(None)，前端回退到 "HF" 文字徽章。
-#[tauri::command]
-async fn hf_avatar(app: AppHandle, author: String) -> Result<Option<String>, String> {
-    let author = author.trim().trim_start_matches('@').to_string();
-    if author.is_empty() || author.len() > 120 || !author.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
-        return Ok(None);
-    }
-    if let Some(cached) = avatar_cache().lock().map_err(|_| "头像缓存不可用")?.get(&author) {
-        return Ok(cached.clone());
-    }
-    let config = read_config(&app)?;
-    let network = config.network.clone().unwrap_or_default();
-    let cache_key = author.clone();
-    let fetched = tauri::async_runtime::spawn_blocking(move || {
-        let author = cache_key.as_str();
-        let mut channels: Vec<(reqwest::blocking::Client, bool)> = Vec::new();
-        if let Ok(client) = build_net_client(&network) {
-            channels.push((client, false));
-        }
-        channels.push((direct_client().clone(), false));
-        if let Some(proxy_url) = probe_local_proxy() {
-            if let Ok(proxied) = proxied_client(&proxy_url) {
-                channels.push((proxied, false));
-            }
-        }
-        channels.push((direct_client().clone(), true)); // 镜像通道
-        let mut errors: Vec<String> = Vec::new();
-        for (client, mirror) in &channels {
-            match hf_resolve_avatar_url(client, author, *mirror) {
-                Ok(cdn_url) => match hf_fetch_avatar_image(client, &cdn_url, *mirror) {
-                    Ok((mime, bytes)) => return Ok(Some(format!("data:{};base64,{}", mime, base64_encode(&bytes)))),
-                    Err(error) => errors.push(error),
-                },
-                Err(error) => errors.push(error),
-            }
-        }
-        Err(format!("头像获取失败：{}", errors.join("；")))
-    })
-    .await
-    .map_err(|error| format!("获取头像任务中断：{}", error))?;
-    let data_uri = fetched.ok().flatten();
-    avatar_cache().lock().map_err(|_| "头像缓存不可用")?.insert(author, data_uri.clone());
-    Ok(data_uri)
-}
-
-/// HF / 直链下载共用的传输核心：带鉴权发起请求 → 状态检查（gated 错误协议）→
-/// （可选）Range 断点续传 → 流式落盘（200ms 节流进度 + 速度平滑 + 每任务独立的取消/暂停处理）。
-/// allow_resume：HF 仓库下载启用「文件已存在直接返回」与 Range 续传；直链下载行为保持原样（false）。
-#[cfg(not(target_os = "linux"))]
-#[allow(clippy::too_many_arguments)]
-fn hf_transfer_loop(
-    app: &AppHandle,
-    registry: &DownloadRegistry,
-    task: &Arc<DownloadTaskControl>,
-    task_id: &str,
-    repo_label: &str,
-    file_label: &str,
-    net_client: &reqwest::blocking::Client,
-    url: &str,
-    hf_token: &str,
-    dest: &Path,
-    allow_resume: bool,
-) -> Result<u64, String> {
-    use std::io::{Read as _, Write as _};
-    let mut request = net_client.get(url).timeout(std::time::Duration::from_secs(3600));
-    if !hf_token.is_empty() && is_hf_url(url) {
-        request = request.bearer_auth(hf_token);
-    }
-    let mut response = request.send().map_err(|error| format!("下载失败：{}", error))?;
-    if !response.status().is_success() {
-        let code = response.status().as_u16();
-        if code == 401 || code == 403 {
-            if hf_token.trim().is_empty() {
-                return Err("HF_GATED_NEED_TOKEN::该模型需要授权（gated），请在设置中配置 Hugging Face Token".into());
-            }
-            return Err("HF_GATED_NO_PERMISSION::该模型无访问权限，请前往网页端同意模型许可协议后重试".into());
-        }
-        if code == 404 {
-            return Err("文件不存在或仓库未公开（HTTP 404）".into());
-        }
-        return Err(format!("下载失败：HTTP {}", code));
-    }
-    let mut full_total: u64 = response.content_length().unwrap_or(0);
-    // 已完整下载过：直接返回，不重复走网络（仅断点续传路径启用）
-    if allow_resume && dest.exists() && full_total > 0 {
-        let existing_len = fs::metadata(dest).map(|meta| meta.len()).unwrap_or(0);
-        if existing_len >= full_total {
-            emit_model_progress(app, task_id, repo_label, file_label, "done", 100, existing_len, full_total, 0, "文件已存在");
-            return Ok(existing_len);
-        }
-    }
-
-    // 断点续传：目标已存在则携带 Range 续传；服务器忽略 Range（返回 200）时从头覆盖
-    let mut downloaded: u64 = 0;
-    if allow_resume && dest.exists() {
-        downloaded = fs::metadata(dest).map(|meta| meta.len()).unwrap_or(0);
-    }
-    let mut file_handle: fs::File;
-    if downloaded > 0 {
-        let range = format!("bytes={}-", downloaded);
-        let mut ranged_request = net_client.get(url).header("range", &range).timeout(std::time::Duration::from_secs(3600));
-        if !hf_token.is_empty() && is_hf_url(url) {
-            ranged_request = ranged_request.bearer_auth(hf_token);
-        }
-        let ranged = ranged_request.send().map_err(|error| format!("下载失败：{}", error))?;
-        if ranged.status().as_u16() == 206 {
-            response = ranged;
-            file_handle = fs::OpenOptions::new().append(true).create(true).open(dest).map_err(|error| format!("打开下载文件失败：{}", error))?;
-        } else if ranged.status().is_success() {
-            response = ranged;
-            downloaded = 0;
-            if let Some(total) = response.content_length() {
-                full_total = total;
-            }
-            file_handle = fs::File::create(dest).map_err(|error| format!("创建下载文件失败：{}", error))?;
-        } else {
-            return Err(format!("下载失败：HTTP {}", ranged.status()));
-        }
-    } else {
-        file_handle = fs::File::create(dest).map_err(|error| format!("创建下载文件失败：{}", error))?;
-    }
-
-    let mut buffer = [0u8; 128 * 1024];
-    let start_ms = now_ms();
-    let mut last_emit_ms = start_ms;
-    let mut last_speed_ms = start_ms;
-    let mut last_speed_bytes = downloaded;
-    let mut current_speed: u64 = 0;
-    loop {
-        // 孤儿循环自检：自己已不是该 taskId 注册的控制器（被新一轮下载接管或已摘除）→ 立即退出，
-        // 否则暂停 / 取消标志永远送不到这个循环，它会带着过期进度一直下载
-        if !registry.is_current(task_id, task) {
-            drop(file_handle);
-            return Err("下载任务已被接管".into());
-        }
-        if task.cancel.load(Ordering::Relaxed) {
-            drop(file_handle);
-            let _ = fs::remove_file(dest);
-            let _ = fs::remove_file(hf_partial_path(dest));
-            emit_model_progress(app, task_id, repo_label, file_label, "cancelled", 0, 0, 0, 0, "下载已取消");
-            return Err("下载已取消".into());
-        }
-        if task.pause.load(Ordering::Relaxed) {
-            // 暂停：保留 .part 断点文件（前端「继续」时按 Range 续传），清掉暂停标志
-            task.pause.store(false, Ordering::Relaxed);
-            file_handle.flush().ok();
-            drop(file_handle);
-            let part = hf_partial_path(dest);
-            let _ = fs::remove_file(&part);
-            let _ = fs::rename(dest, &part);
-            emit_model_progress(app, task_id, repo_label, file_label, "paused", 0, downloaded, full_total, 0, "已暂停，剩余部分保留在 .part 断点文件");
-            return Err("下载已暂停".into());
-        }
-        let count = response.read(&mut buffer).map_err(|error| format!("下载中断：{}", error))?;
-        if count == 0 {
-            break;
-        }
-        file_handle.write_all(&buffer[..count]).map_err(|error| format!("写入下载文件失败：{}", error))?;
-        downloaded += count as u64;
-        let now = now_ms();
-        let speed_dt = now.saturating_sub(last_speed_ms);
-        if speed_dt >= 500 {
-            let bytes_delta = downloaded.saturating_sub(last_speed_bytes);
-            let instant = bytes_delta * 1000 / speed_dt;
-            current_speed = if current_speed == 0 { instant } else { (current_speed * 3 + instant * 7) / 10 };
-            last_speed_ms = now;
-            last_speed_bytes = downloaded;
-        }
-        if now.saturating_sub(last_emit_ms) >= 200 {
-            let percent = if full_total > 0 { ((downloaded as f64 / full_total as f64) * 100.0) as u32 } else { 0 };
-            emit_model_progress(app, task_id, repo_label, file_label, "download", percent, downloaded, full_total, current_speed, format!("{downloaded}/{full_total}"));
-            last_emit_ms = now;
-        }
-    }
-    file_handle.flush().map_err(|error| error.to_string())?;
-    emit_model_progress(app, task_id, repo_label, file_label, "done", 100, downloaded, full_total, 0, "下载完成");
-    Ok(downloaded)
-}
-
-#[cfg(target_os = "linux")]
-#[tauri::command]
-async fn hf_download(app: AppHandle, state: State<'_, DownloadRegistry>, repo: String, file: String, task_id: String) -> Result<HfDownloadResult, String> {
-    let config = read_config(&app)?;
-    let network = config.network.clone().unwrap_or_default();
-    let token = config.hf_token.clone().unwrap_or_default();
-    let root = models_root(&app, &config)?;
-    let dest = model_download_dest(&root, &repo, &file)?;
-    let url = format!("{}/{}/resolve/main/{}", HF_DL_BASE, hf_repo_id(&repo), file);
-    let registry = state.inner().clone();
-    linux_model_download::run(&app, &registry, &network, &token, &dest, &url, &task_id, &repo, &file).await
-}
-
-#[cfg(target_os = "linux")]
-#[tauri::command]
-async fn hf_download_url(app: AppHandle, state: State<'_, DownloadRegistry>, url: String, task_id: String) -> Result<HfDownloadResult, String> {
-    let config = read_config(&app)?;
-    let network = config.network.clone().unwrap_or_default();
-    let token = config.hf_token.clone().unwrap_or_default();
-    let root = models_root(&app, &config)?;
-    let raw_name = url.rsplit('/').next().filter(|name| !name.trim().is_empty()).unwrap_or("model.gguf").trim().to_string();
-    let file_name: String = raw_name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect();
-    let file_name = if file_name.to_lowercase().ends_with(".gguf") { file_name } else { format!("{}.gguf", file_name) };
-    let dest = root.join(&file_name);
-    let registry = state.inner().clone();
-    linux_model_download::run(&app, &registry, &network, &token, &dest, &url, &task_id, "direct-url", &file_name).await
-}
-
-/// 下载 HuggingFace 仓库中的指定文件到模型存储目录（流式 + 进度事件 + 断点续传）。
-/// task_id：前端为每次下载生成的唯一标识；取消 / 暂停只作用于该任务自己的控制器。
-#[cfg(not(target_os = "linux"))]
-#[tauri::command]
-async fn hf_download(app: AppHandle, state: State<'_, DownloadRegistry>, repo: String, file: String, task_id: String) -> Result<HfDownloadResult, String> {
-    let config = read_config(&app)?;
-    let network = config.network.clone().unwrap_or_default();
-    let hf_token = config.hf_token.clone().unwrap_or_default();
-    let root = models_root(&app, &config)?;
-    let registry = state.inner().clone();
-    let task = registry.register(&task_id);
-    let loop_registry = registry.clone();
-    let cleanup_task = task.clone();
-    let closure_task_id = task_id.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        let client = build_net_client(&network)?;
-        let dest = model_download_dest(&root, &repo, &file)?;
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).map_err(|error| format!("创建下载目录失败：{}", error))?;
-        }
-        // 恢复上次暂停留下的 .part 断点文件（暂停时 dest 被改名 dest.part，先改回以便断点续传）
-        let part_path = hf_partial_path(&dest);
-        if !dest.exists() && part_path.exists() {
-            let _ = fs::rename(&part_path, &dest);
-        }
-        let url = format!("{}/{}/resolve/main/{}", HF_DL_BASE, hf_repo_id(&repo), file);
-        emit_model_progress(&app, &closure_task_id, &repo, &file, "download", 0, 0, 0, 0, "开始下载");
-        // 多通道兜底：配置代理 → 直连 → 本机代理端口 → hf-mirror 镜像（浏览器常走 TUN / 软路由透明代理）
-        let (net_client, effective_url) = download_hf_with_fallback(&client, &url)?;
-        let size_bytes = hf_transfer_loop(&app, &loop_registry, &task, &closure_task_id, &repo, &file, &net_client, &effective_url, &hf_token, &dest, true)?;
-        Ok(HfDownloadResult {
-            path: dest.to_string_lossy().to_string(),
-            size_bytes,
-        })
-    })
-    .await;
-    // 无论成功失败都摘除控制器（若已被新一轮下载接管则保留新循环的控制器）
-    registry.unregister_if_current(&task_id, &cleanup_task);
-    result.map_err(|error| format!("下载任务中断：{}", error))?
-}
-
-
-/// 从任意直链 URL 下载文件到模型存储目录（流式 + 进度事件）。
-/// task_id：前端生成的唯一任务标识，取消 / 暂停只作用于该任务。
-#[cfg(not(target_os = "linux"))]
-#[tauri::command]
-async fn hf_download_url(app: AppHandle, state: State<'_, DownloadRegistry>, url: String, task_id: String) -> Result<HfDownloadResult, String> {
-    let config = read_config(&app)?;
-    let network = config.network.clone().unwrap_or_default();
-    let hf_token = config.hf_token.clone().unwrap_or_default();
-    let root = models_root(&app, &config)?;
-    let registry = state.inner().clone();
-    let task = registry.register(&task_id);
-    let loop_registry = registry.clone();
-    let cleanup_task = task.clone();
-    let closure_task_id = task_id.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        let client = build_net_client(&network)?;
-        let raw_name = url.rsplit('/').next().filter(|name| !name.trim().is_empty()).unwrap_or("model.gguf").trim().to_string();
-        let file_name: String = raw_name
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
-            .collect();
-        let file_name = if file_name.to_lowercase().ends_with(".gguf") { file_name } else { format!("{}.gguf", file_name) };
-        let dest = root.join(&file_name);
-        // 恢复上次暂停留下的 .part 断点文件
-        let part_path = hf_partial_path(&dest);
-        if !dest.exists() && part_path.exists() {
-            let _ = fs::rename(&part_path, &dest);
-        }
-        let repo_id = "direct-url";
-        emit_model_progress(&app, &closure_task_id, repo_id, &file_name, "download", 0, 0, 0, 0, "开始下载");
-        // 多通道兜底：配置代理 → 直连 → 本机代理端口 → hf-mirror 镜像
-        let (net_client, effective_url) = download_hf_with_fallback(&client, &url)?;
-        let size_bytes = hf_transfer_loop(&app, &loop_registry, &task, &closure_task_id, repo_id, &file_name, &net_client, &effective_url, &hf_token, &dest, false)?;
-        Ok(HfDownloadResult {
-            path: dest.to_string_lossy().to_string(),
-            size_bytes,
-        })
-    })
-    .await;
-    registry.unregister_if_current(&task_id, &cleanup_task);
-    result.map_err(|error| format!("下载任务中断：{}", error))?
-}
-
-/// 查询模型存储目录空间：Windows GetDiskFreeSpaceExW / Linux statvfs。
-fn free_disk_space(path: &Path) -> Result<(u64, u64), String> {
-    #[cfg(target_os = "linux")]
-    { platform::disk_space(path) }
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-        unsafe {
-            let mut free_avail: u64 = 0;
-            let mut total: u64 = 0;
-            let rc = GetDiskFreeSpaceExW(wide.as_ptr(), &mut free_avail, &mut total, std::ptr::null_mut());
-            if rc == 0 { Err(std::io::Error::last_os_error().to_string()) } else { Ok((total, free_avail)) }
-        }
-    }
-    #[cfg(not(any(windows, target_os = "linux")))]
-    {
-        let _ = path;
-        Err("此平台磁盘空间查询尚未开放".into())
-    }
-}
-
-/// 读取当前模型存储目录与剩余空间（缺省目录首次访问自动创建）。
-#[tauri::command]
-fn get_models_dir(app: AppHandle) -> Result<DiskUsage, String> {
-    let config = read_config(&app)?;
-    let root = models_root(&app, &config)?;
-    fs::create_dir_all(&root).map_err(|error| error.to_string())?;
-    let (total, free) = free_disk_space(&root)?;
-    Ok(DiskUsage {
-        path: root.to_string_lossy().to_string(),
-        total_bytes: total,
-        free_bytes: free,
-    })
-}
-
-/// 选择模型存储目录：校验可写（写入探针文件），不直接持久化（由前端保存配置）。
-#[tauri::command]
-fn pick_models_dir(app: AppHandle) -> Result<String, String> {
-    let Some(file_path) = app.dialog().file().blocking_pick_folder() else {
-        return Ok(String::new());
-    };
-    let Some(folder) = file_path.as_path() else {
-        return Ok(String::new());
-    };
-    let probe = folder.join(".cookllm_write_test");
-    let writable = fs::write(&probe, b"ok").is_ok();
-    if !writable {
-        return Err("所选目录不可写，请更换目录".into());
-    }
-    let _ = fs::remove_file(&probe);
-    Ok(folder.to_string_lossy().to_string())
-}
-
-/* ==================== 阶段一：硬件探测（CUDA / Vulkan / CPU 推荐） ==================== */
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct HardwareSuggestion {
-    recommended_backend: String,
-    gpu_name: Option<String>,
-    cuda_supported: bool,
-    vulkan_supported: bool,
-}
-
-#[cfg(target_os = "windows")]
-fn load_library_exists(dll_name: &str) -> bool {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
-    let wide: Vec<u16> = std::ffi::OsStr::new(dll_name).encode_wide().chain(std::iter::once(0)).collect();
-    unsafe {
-        // 已加载则直接命中；否则尝试加载（FreeLibrary 不在 windows-sys 0.59 可用 API 中）
-        !GetModuleHandleW(wide.as_ptr()).is_null() || !LoadLibraryW(wide.as_ptr()).is_null()
-    }
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
-fn load_library_exists(_dll_name: &str) -> bool {
-    false
-}
-
-#[cfg(not(target_os = "linux"))]
-fn system32_dll_present(name: &str) -> bool {
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
-    PathBuf::from(root).join("System32").join(name).exists()
-}
-
-/// 查询 NVIDIA GPU 名称（nvidia-smi 首行），查询失败返回 None。
-fn query_gpu_name() -> Option<String> {
-    let _busy = BusyGuard::acquire(&GPU_QUERY_BUSY)?;
-    let path = find_nvidia_smi()?;
-    let mut command = Command::new(&path);
-    command.args(["--query-gpu=name", "--format=csv,noheader,nounits"]).stdout(Stdio::piped()).stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
-    let output = gpu_command_output(&mut command)?;
-    String::from_utf8(output.stdout).ok()?.lines().map(str::trim).find(|line| !line.is_empty()).map(String::from)
-}
-
-/// 探测运行环境并推荐最合适的 llama.cpp 构建后端：cuda > vulkan > cpu。
-#[tauri::command]
-fn detect_hardware() -> HardwareSuggestion {
-    #[cfg(target_os = "linux")]
-    let (nvidia_present, vulkan_present, gpu_name) = {
-        let nvidia = query_gpu_name();
-        let vulkan = platform::find_in_path("vulkaninfo", std::env::var_os("PATH").as_deref())
-            .and_then(|path| platform::checked_tool(Command::new(path).arg("--summary"), None, std::time::Duration::from_secs(2)).ok())
-            .and_then(|output| platform::vulkan_device(&String::from_utf8_lossy(&output.stdout)));
-        (nvidia.is_some(), vulkan.is_some(), nvidia.or(vulkan))
-    };
-    #[cfg(not(target_os = "linux"))]
-    let (nvidia_present, vulkan_present, gpu_name) = {
-        let nvidia = find_nvidia_smi().is_some() || system32_dll_present("nvcuda.dll");
-        let vulkan = load_library_exists("vulkan-1.dll") || system32_dll_present("vulkan-1.dll");
-        (nvidia, vulkan, if nvidia { query_gpu_name() } else { None })
-    };
-    let recommended_backend = if nvidia_present { "cuda" } else if vulkan_present { "vulkan" } else { "cpu" };
-    HardwareSuggestion {
-        recommended_backend: recommended_backend.into(),
-        gpu_name,
-        cuda_supported: nvidia_present,
-        vulkan_supported: vulkan_present,
-    }
-}
-
-/* ==================== 阶段二：代理与网络请求配置 ==================== */
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct NetworkConfig {
-    /// "system"（跟随系统代理）/ "manual"（手动 HTTP/SOCKS5）/ "direct"（直连）
-    #[serde(default = "default_proxy_mode")]
-    proxy_mode: String,
-    #[serde(default)]
-    proxy_url: String,
-}
-
-fn default_proxy_mode() -> String {
-    "system".into()
-}
-
-impl Default for NetworkConfig {
-    fn default() -> Self {
-        Self {
-            proxy_mode: default_proxy_mode(),
-            proxy_url: String::new(),
-        }
-    }
-}
-
-/// 按配置构建 reqwest 客户端（带缓存）：网络配置不变时复用同一 Client，
-/// 避免每个命令重建连接池 + TLS 会话（hf_avatar 每个作者调用一次，开销成倍放大）。
-/// 配置变更（key 不匹配）时自动重建，无需手动失效。
-fn build_net_client(network: &NetworkConfig) -> Result<reqwest::blocking::Client, String> {
-    static CLIENT_CACHE: OnceLock<Mutex<Option<(String, reqwest::blocking::Client)>>> = OnceLock::new();
-    let key = format!("{}|{}", network.proxy_mode, network.proxy_url.trim());
-    if let Some(client) = CLIENT_CACHE.get_or_init(|| Mutex::new(None)).lock().ok().and_then(|guard| guard.as_ref().filter(|(cached_key, _)| cached_key == &key).map(|(_, client)| client.clone())) {
-        return Ok(client);
-    }
-    let client = build_net_client_fresh(network)?;
-    if let Ok(mut guard) = CLIENT_CACHE.get_or_init(|| Mutex::new(None)).lock() {
-        *guard = Some((key, client.clone()));
-    }
-    Ok(client)
-}
-
-/// 实际构建逻辑（无缓存）：manual 注入 Proxy::all，system 走系统代理（默认行为），direct 直连并忽略代理。
-fn build_net_client_fresh(network: &NetworkConfig) -> Result<reqwest::blocking::Client, String> {
-    #[cfg(target_os = "linux")]
-    let environment = platform::ProxyEnvironment::read(|key| std::env::var(key).ok());
-    build_net_client_with_environment(network, #[cfg(target_os = "linux")] &environment)
-}
-
-fn build_net_client_with_environment(network: &NetworkConfig, #[cfg(target_os = "linux")] environment: &platform::ProxyEnvironment) -> Result<reqwest::blocking::Client, String> {
-    let mut builder = reqwest::blocking::Client::builder()
-        .user_agent(HF_UA)
-        .connect_timeout(std::time::Duration::from_secs(10));
-    if network.proxy_mode == "manual" {
-        let url = network.proxy_url.trim();
-        if url.is_empty() {
-            return Err("手动代理地址为空，请填写 http://127.0.0.1:7890 或 socks5://...".into());
-        }
-        let proxy = reqwest::Proxy::all(url).map_err(|error| format!("代理地址无效：{}", error))?;
-        builder = builder.no_proxy().proxy(proxy);
-    } else if network.proxy_mode == "direct" {
-        // 直连：显式忽略系统代理 / 手动代理
-        builder = builder.no_proxy();
-    } else if network.proxy_mode == "system" {
-        #[cfg(target_os = "linux")]
-        { builder = environment.apply(builder)?; }
-    } else {
-        return Err("未知代理模式".into());
-    }
-    builder.build().map_err(|error| format!("初始化网络客户端失败：{}", error))
-}
-
-/// 读取系统代理地址（仅 Windows）：读 HKCU 代理设置，ProxyEnable=1 时返回代理地址，否则返回 None。
-#[cfg(windows)]
-fn read_system_proxy_windows() -> Option<String> {
-    use windows_sys::Win32::System::Registry::{HKEY, HKEY_CURRENT_USER, KEY_READ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW};
-
-    const SETTINGS_PATH: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
-    unsafe {
-        let mut key: HKEY = std::ptr::null_mut();
-        let path: Vec<u16> = SETTINGS_PATH.encode_utf16().chain(std::iter::once(0)).collect();
-        if RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, KEY_READ, &mut key) != 0 || key.is_null() {
-            return None;
-        }
-        let cleanup = || RegCloseKey(key);
-        // ProxyEnable = 1 才启用代理
-        let mut enabled: u32 = 0;
-        let mut size = std::mem::size_of::<u32>() as u32;
-        let name: Vec<u16> = "ProxyEnable".encode_utf16().chain(std::iter::once(0)).collect();
-        let rc = RegQueryValueExW(key, name.as_ptr(), std::ptr::null(), std::ptr::null_mut(), &mut enabled as *mut u32 as *mut u8, &mut size);
-        if rc != 0 || enabled == 0 {
-            cleanup();
-            return None;
-        }
-        // ProxyServer（可能形如 127.0.0.1:7890 或 http=...;https=...）
-        let name2: Vec<u16> = "ProxyServer".encode_utf16().chain(std::iter::once(0)).collect();
-        let mut buf = [0u16; 512];
-        let mut buf_size = (buf.len() * std::mem::size_of::<u16>()) as u32;
-        let rc = RegQueryValueExW(key, name2.as_ptr(), std::ptr::null(), std::ptr::null_mut(), buf.as_mut_ptr() as *mut u8, &mut buf_size);
-        cleanup();
-        if rc != 0 {
-            return None;
-        }
-        let wide_end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        let raw = String::from_utf16_lossy(&buf[..wide_end]);
-        // 取第一段并去掉 http=/https= 前缀
-        let segment = raw.split(';').next().unwrap_or("").trim().trim_end_matches('/');
-        let host = segment.rsplit('=').next().unwrap_or(segment).trim();
-        if host.is_empty() { None } else { Some(host.to_string()) }
-    }
-}
-
-#[tauri::command]
-fn get_system_proxy() -> Option<String> {
-    #[cfg(windows)]
-    {
-        read_system_proxy_windows()
-    }
-    #[cfg(target_os = "linux")]
-    { platform::ProxyEnvironment::read(|key| std::env::var(key).ok()).display() }
-    #[cfg(not(any(windows, target_os = "linux")))]
-    { None }
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ProxyTestResult {
-    ok: bool,
-    status: String,
-    detail: String,
-    latency_ms: u64,
-}
-
-/// 测试与 GitHub 的连通性：manual 走自定义代理，system 走系统代理（后台线程执行，避免阻塞 UI）。
-fn test_proxy_connection_impl(network: NetworkConfig) -> Result<ProxyTestResult, String> {
-    let client = build_net_client(&network)?;
-    let target = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest";
-    test_proxy_with_client(&client, target, std::time::Duration::from_secs(25))
-}
-
-fn test_proxy_with_client(client: &reqwest::blocking::Client, target: &str, timeout: std::time::Duration) -> Result<ProxyTestResult, String> {
-    let start = now_ms();
-    match client.get(target).header("accept", "application/vnd.github+json").timeout(timeout).send() {
-        Ok(response) => {
-            let code = response.status().as_u16();
-            let ok = (200..400).contains(&code);
-            Ok(ProxyTestResult {
-                ok,
-                status: code.to_string(),
-                detail: if ok { "连接成功，网络可用".into() } else { format!("服务返回 HTTP {}", code) },
-                latency_ms: now_ms().saturating_sub(start),
-            })
-        }
-        Err(error) => Ok(ProxyTestResult { ok: false, status: "ERR".into(), detail: format!("连接失败：{}", error), latency_ms: now_ms().saturating_sub(start) }),
-    }
-}
-
-#[tauri::command]
-async fn test_proxy_connection(
-    app: AppHandle,
-    proxy_mode: Option<String>,
-    proxy_url: Option<String>,
-) -> Result<ProxyTestResult, String> {
-    let mut network = read_config(&app)?.network.unwrap_or_default();
-    if let Some(mode) = proxy_mode {
-        network.proxy_mode = mode;
-    }
-    if let Some(url) = proxy_url {
-        network.proxy_url = url;
-    }
-    tauri::async_runtime::spawn_blocking(move || test_proxy_connection_impl(network))
-        .await
-        .map_err(|error| format!("连接测试任务中断：{}", error))?
-}
-
-/* ==================== 阶段三：llama.cpp 获取、解压与原子覆盖 ==================== */
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LlamaCppAsset {
-    backend: String,
-    /// CUDA 主版本（如 "12" / "13"）；非 cuda 后端为空字符串
-    cuda_version: String,
-    /// CUDA 完整版本（如 "12.4"）；非 cuda 或无法识别时为空字符串
-    cuda_full_version: String,
-    file_name: String,
-    url: String,
-    size: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sha256: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LlamaCppRelease {
-    tag: String,
-    assets: Vec<LlamaCppAsset>,
-    /// 对应的 CUDA 运行时包（cudart-...zip），仅 cuda 后端时有值
-    cudart_assets: Vec<LlamaCppAsset>,
-    match_backend: String,
-    match_asset: Option<LlamaCppAsset>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LlamaCppLocalStatus {
-    install_dir: String,
-    local_version: Option<String>,
-    local_backend: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cuda_version: Option<String>,
-    server_available: bool,
-    server_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    engine_type: Option<String>,
-}
-
-/// llama.cpp 官方仓库（2024 起迁移到 ggml-org，旧 ggerganov 已 301 重定向）。
-const LLAMA_CPP_REPO: &str = "ggml-org/llama.cpp";
-fn llama_api_base() -> String {
-    format!("https://api.github.com/repos/{}", LLAMA_CPP_REPO)
-}
-
-fn llama_exe_name() -> &'static str {
-    if cfg!(windows) { "llama-server.exe" } else { "llama-server" }
-}
-
-/// 模型存储根目录：优先用户配置的自定义目录，其次应用数据目录下的 models（首次访问自动创建）。
-fn models_root(app: &AppHandle, config: &AppConfig) -> Result<PathBuf, String> {
-    if let Some(dir) = config.models_dir.as_deref().filter(|path| !path.trim().is_empty()) {
-        return Ok(PathBuf::from(dir.trim()));
-    }
-    let directory = app.path().app_data_dir().map_err(|error| error.to_string())?;
-    let path = directory.join("models");
-    fs::create_dir_all(&path).map_err(|error| format!("创建模型目录失败：{}", error))?;
-    Ok(path)
-}
-
-fn llamacpp_root(app: &AppHandle, config: &AppConfig) -> Result<PathBuf, String> {
-    let server_path = config.server_path.trim().to_string();
-    if !server_path.is_empty() {
-        let exe = PathBuf::from(&server_path);
-        if exe.file_name().is_some() {
-            if let Some(parent) = exe.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-                return Ok(parent.to_path_buf());
-            }
-        }
-    }
-    if let Some(dir) = config.llamacpp_dir.as_deref().filter(|path| !path.trim().is_empty()) {
-        return Ok(PathBuf::from(dir.trim()));
-    }
-    let directory = app.path().app_data_dir().map_err(|error| error.to_string())?;
-    Ok(directory.join("llamacpp"))
-}
-
-/// 从文本中提取 bXXXX 构建号（如 "llama-b5678-bin-win-cuda..." -> "b5678"）。
-fn extract_build_number(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    for (index, byte) in bytes.iter().enumerate() {
-        if *byte == b'b' && index + 1 < bytes.len() && bytes[index + 1].is_ascii_digit() {
-            let mut end = index + 1;
-            while end < bytes.len() && bytes[end].is_ascii_digit() {
-                end += 1;
-            }
-            return Some(text[index..end].to_string());
+        if !profile_id.is_empty() {
+            return Some((model.id.clone(), profile_id));
         }
     }
     None
 }
 
-fn local_llamacpp_version(bin_dir: &Path) -> Option<String> {
-    let version_file = bin_dir.join("version.txt");
-    if let Ok(text) = fs::read_to_string(&version_file) {
-        let version = text.trim().to_string();
-        if !version.is_empty() {
-            return Some(version);
+pub(crate) fn sync_global_shortcuts(app: &AppHandle, config: &AppConfig) {
+    let gs = app.global_shortcut();
+    let _ = gs.unregister_all();
+
+    let mut registered = RegisteredShortcuts::default();
+    let sc = config.shortcuts.clone().unwrap_or_default();
+
+    if !sc.enabled {
+        if let Ok(mut g) = get_registered_shortcuts().lock() {
+            *g = registered;
         }
+        return;
     }
-    bin_dir.file_name().and_then(|name| name.to_str()).and_then(extract_build_number)
-}
 
-/// 读取本地安装状态（纯本地逻辑，不访问网络）。支持指定 custom_path 检测特定分支或目录。
-#[tauri::command]
-fn get_llamacpp_status(app: AppHandle, custom_path: Option<String>) -> Result<LlamaCppLocalStatus, String> {
-    let config = read_config(&app)?;
-    let (server_path, install_dir) = if let Some(target) = custom_path.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let p = PathBuf::from(target);
-        if p.is_file() {
-            let parent = p.parent().map(|dir| dir.to_path_buf()).unwrap_or_else(|| p.clone());
-            (Some(p), parent)
-        } else if p.is_dir() {
-            let exe = find_server_executable(&p, 0);
-            (exe, p)
-        } else {
-            (None, p)
+    let try_register = |key_str: &str, _action_name: &str| -> Option<Shortcut> {
+        let trimmed = key_str.trim();
+        if trimmed.is_empty() {
+            return None;
         }
-    } else {
-        let install_dir = llamacpp_root(&app, &config)?;
-        let configured_path = config.server_path.trim();
-        let server_path = if !configured_path.is_empty() && PathBuf::from(configured_path).is_file() {
-            Some(PathBuf::from(configured_path))
-        } else if install_dir.exists() {
-            find_server_executable(&install_dir, 0)
-        } else {
-            None
-        };
-        (server_path, install_dir)
-    };
-
-    let mut local_backend = "cpu".into();
-    let mut local_version = None;
-    if let Some(exe) = server_path.as_ref() {
-        let exe_str = exe.to_string_lossy().to_string();
-        let engine_type = detect_engine_type(&exe_str);
-        let bin_dir = exe.parent().unwrap_or(&install_dir).to_path_buf();
-
-        if engine_type == "ninfer" || engine_type == "ninfer_kvmem" {
-            local_backend = "cuda".into();
-            let mut local_cuda_version = None;
-            let build_info_candidates = [
-                bin_dir.join("BUILD-INFO.json"),
-                bin_dir.parent().map(|p| p.join("BUILD-INFO.json")).unwrap_or_default(),
-                bin_dir.parent().and_then(|p| p.parent()).map(|p| p.join("BUILD-INFO.json")).unwrap_or_default(),
-            ];
-            for cand in &build_info_candidates {
-                if cand.is_file() {
-                    if let Ok(content) = fs::read_to_string(cand) {
-                        if let Ok(info) = serde_json::from_str::<serde_json::Value>(&content) {
-                            if let Some(rel) = info.get("release").and_then(|v| v.as_str()) {
-                                local_version = Some(rel.to_string());
-                            }
-                            if let Some(cuda) = info.pointer("/build/cuda_version").and_then(|v| v.as_str()) {
-                                local_cuda_version = Some(cuda.to_string());
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-            if local_cuda_version.is_none() {
-                local_cuda_version = get_installed_cuda_version(&bin_dir);
-            }
-            if local_version.is_none() {
-                local_version = Some(if engine_type == "ninfer_kvmem" { "KVMem-sm120a".into() } else { "NInfer".into() });
-            }
-            return Ok(LlamaCppLocalStatus {
-                install_dir: install_dir.to_string_lossy().to_string(),
-                local_version,
-                local_backend,
-                cuda_version: local_cuda_version,
-                server_available: true,
-                server_path: Some(exe_str),
-                engine_type: Some(engine_type.to_string()),
-            });
-        }
-
-        local_version = local_llamacpp_version(&bin_dir);
-        // 优先读安装时写入的 backend.txt，回退按路径名与 DLL 推断
-        if let Ok(text) = fs::read_to_string(bin_dir.join("backend.txt")) {
-            let value = text.trim().to_lowercase();
-            if value == "cuda" || value == "vulkan" || value == "cpu" {
-                local_backend = value;
-            }
-        } else {
-            let path_text = bin_dir.to_string_lossy().to_lowercase();
-            let has_cuda = path_text.contains("cuda") || has_cuda_runtime_dll(&bin_dir, "13") || has_cuda_runtime_dll(&bin_dir, "12") || has_cuda_runtime_dll(&bin_dir, "11");
-            let has_vulkan = path_text.contains("vulkan") || bin_dir.join("vulkan-1.dll").is_file();
-            local_backend = if has_cuda { "cuda" } else if has_vulkan { "vulkan" } else { "cpu" }.into();
-        }
-        let mut local_cuda_version = None;
-        if local_backend == "cuda" {
-            local_cuda_version = get_installed_cuda_version(&bin_dir);
-        }
-        return Ok(LlamaCppLocalStatus {
-            install_dir: install_dir.to_string_lossy().to_string(),
-            local_version,
-            local_backend,
-            cuda_version: local_cuda_version,
-            server_available: server_path.as_ref().map(|p| p.is_file()).unwrap_or(false),
-            server_path: server_path.map(|path| path.to_string_lossy().to_string()),
-            engine_type: Some("llamacpp".into()),
-        });
-    }
-    Ok(LlamaCppLocalStatus {
-        install_dir: install_dir.to_string_lossy().to_string(),
-        local_version,
-        local_backend,
-        cuda_version: None,
-        server_available: false,
-        server_path: None,
-        engine_type: None,
-    })
-}
-
-fn fetch_github_release(client: &reqwest::blocking::Client, url: &str) -> Result<serde_json::Value, String> {
-    let response = client
-        .get(url)
-        .header("accept", "application/vnd.github+json")
-        .header("user-agent", HF_UA)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .map_err(|error| format!("请求 GitHub API 失败：{}", error))?;
-    if !response.status().is_success() {
-        let code = response.status().as_u16();
-        if code == 403 {
-            return Err("GitHub API 触发限流（HTTP 403），可尝试切换代理或稍后重试".into());
-        }
-        return Err(format!("GitHub API 返回 HTTP {}", code));
-    }
-    response.json().map_err(|error| format!("解析 GitHub API 响应失败：{}", error))
-}
-
-/// GitHub API 多通道兜底：配置代理 → 直连 → 本机探测代理端口；错误信息汇总各通道原因。
-fn fetch_github_release_with_fallback(config_client: &reqwest::blocking::Client, url: &str) -> Result<serde_json::Value, String> {
-    with_net_fallback(config_client, url, false, fetch_github_release)
-        .map_err(|errors| format!("GitHub API 连接失败（{}）。请在「设置 → 网络与代理」选择手动代理（Clash 端口 7897 / V2rayN 10809）后重试", errors.join("；")))
-}
-
-fn version_number(value: &str) -> Vec<u64> {
-    value.trim().trim_start_matches('v').split(|character: char| !character.is_ascii_digit() && character != '.').next().unwrap_or("")
-        .split('.').map(|part| part.parse::<u64>().unwrap_or(0)).collect()
-}
-
-fn is_newer_version(candidate: &str, current: &str) -> bool {
-    let candidate = version_number(candidate);
-    let current = version_number(current);
-    let max_len = candidate.len().max(current.len());
-    for index in 0..max_len {
-        let left = candidate.get(index).copied().unwrap_or(0);
-        let right = current.get(index).copied().unwrap_or(0);
-        if left != right {
-            return left > right;
-        }
-    }
-    false
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AppInstallKind {
-    #[cfg(windows)]
-    Msi,
-    Nsis,
-}
-
-#[cfg(target_os = "windows")]
-fn is_msi_in_registry() -> bool {
-    use std::os::windows::process::CommandExt;
-    let check1 = std::process::Command::new("reg")
-        .args(["query", "HKCU\\Software\\cookllm\\CookLLM", "/v", "Uninstaller Shortcut"])
-        .creation_flags(0x08000000)
-        .output();
-    if let Ok(out) = check1 {
-        if out.status.success() && String::from_utf8_lossy(&out.stdout).contains("0x1") {
-            return true;
-        }
-    }
-    let check2 = std::process::Command::new("reg")
-        .args(["query", "HKCU\\Software\\cookllm\\CookLLM", "/v", "InstallDir"])
-        .creation_flags(0x08000000)
-        .output();
-    if let Ok(out) = check2 {
-        if out.status.success() {
-            return true;
-        }
-    }
-    false
-}
-
-#[cfg(target_os = "windows")]
-fn detect_app_install_kind() -> AppInstallKind {
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(parent) = exe_path.parent() {
-            // 1. NSIS 安装器在安装目录下必然生成实体的卸载程序 uninstall.exe
-            if parent.join("uninstall.exe").is_file() {
-                return AppInstallKind::Nsis;
-            }
-            // 2. WiX MSI 安装器在安装目录下生成卸载快捷方式 Uninstall CookLLM.lnk
-            if parent.join("Uninstall CookLLM.lnk").is_file() {
-                return AppInstallKind::Msi;
-            }
-        }
-    }
-
-    // 3. 注册表检测：WiX MSI 会在 HKCU\Software\cookllm\CookLLM 写入专属的 InstallDir 或快捷方式键值
-    if is_msi_in_registry() {
-        return AppInstallKind::Msi;
-    }
-
-    // 默认回退为 NSIS EXE 安装包
-    AppInstallKind::Nsis
-}
-
-#[cfg(not(target_os = "windows"))]
-fn detect_app_install_kind() -> AppInstallKind {
-    AppInstallKind::Nsis
-}
-
-fn app_installer_from_value(value: &serde_json::Value) -> Option<(String, String, u64, Option<String>)> {
-    if cfg!(target_os = "linux") {
-        #[cfg(target_os = "linux")]
-        return linux_app_update::select(value, linux_app_update::detect().kind).ok()
-            .map(|asset| (asset.url, asset.name, asset.size, Some(asset.digest)));
-    }
-    let assets = value.get("assets")?.as_array()?;
-    let install_kind = detect_app_install_kind();
-
-    assets.iter().filter_map(|item| {
-        let name = item.get("name")?.as_str()?.to_string();
-        let lower = name.to_lowercase();
-        if lower.contains("arm64") || lower.contains("aarch64") { return None; }
-
-        let rank = match install_kind {
-            #[cfg(windows)]
-            AppInstallKind::Msi => {
-                if lower.ends_with(".msi") {
-                    0 // MSI 用户优先匹配下载 MSI，原地覆盖升级
-                } else if lower.ends_with(".exe") && (lower.contains("setup") || lower.contains("nsis")) {
-                    1 // 兜底使用 EXE
-                } else {
-                    return None;
-                }
-            }
-            AppInstallKind::Nsis => {
-                if lower.ends_with(".exe") && (lower.contains("setup") || lower.contains("nsis")) {
-                    0 // EXE 用户优先匹配下载 EXE Setup，原地覆盖升级
-                } else if lower.ends_with(".msi") {
-                    1 // 兜底使用 MSI
-                } else {
-                    return None;
-                }
-            }
-        };
-
-        let url = item.get("browser_download_url")?.as_str()?.to_string();
-        if url.is_empty() { return None; }
-        let size = item.get("size").and_then(serde_json::Value::as_u64).unwrap_or(0);
-        let digest = item.get("digest").and_then(serde_json::Value::as_str).and_then(|text| text.strip_prefix("sha256:")).map(str::to_string);
-        Some((rank, (url, name, size, digest)))
-    }).min_by_key(|(rank, _)| *rank).map(|(_, item)| item)
-}
-
-fn check_app_update_impl(app: &AppHandle) -> Result<AppUpdateInfo, String> {
-    let current_version = app.package_info().version.to_string();
-    let config = read_config(app)?;
-    #[cfg(not(target_os = "linux"))]
-    let release = {
-        let client = build_net_client(&config.network.clone().unwrap_or_default())?;
-        let url = format!("https://api.github.com/repos/{APP_GITHUB_REPO}/releases/latest");
-        fetch_github_release_with_fallback(&client, &url)?
-    };
-    #[cfg(target_os = "linux")]
-    let release = linux_app_update::release_metadata(&config.network.clone().unwrap_or_default(), None, || false)?;
-    let latest_tag = release.get("tag_name").and_then(serde_json::Value::as_str).unwrap_or("").trim().to_string();
-    if latest_tag.is_empty() { return Err("bad-response".into()); }
-    let _installer = if cfg!(target_os = "windows") { app_installer_from_value(&release) } else { None };
-    #[cfg(not(target_os = "linux"))]
-    let installer = _installer;
-    #[cfg(target_os = "linux")]
-    let (installer, install_kind, install_supported, install_reason) = {
-        let context = linux_app_update::detect();
-        match linux_app_update::select(&release, context.kind) {
-            Ok(asset) if linux_app_update::supported(&context) => (
-                Some((asset.url, asset.name, asset.size, Some(asset.digest))),
-                Some(context.kind.name().to_string()), Some(true), Some(context.reason)),
-            Ok(_) => (None, Some("manual".into()), Some(false), Some("当前包已识别，但系统图形安装器或更新辅助工具缺失，请手动更新".into())),
-            Err(reason) => (None, Some("manual".into()), Some(false), Some(if context.kind == linux_app_update::Kind::Manual { context.reason } else { reason })),
-        }
-    };
-    #[cfg(not(target_os = "linux"))]
-    let (install_kind, install_supported, install_reason) = (None, None, None);
-    let (asset_url, asset_name, asset_size, asset_sha256) = installer
-        .map(|(url, name, size, digest)| (Some(url), Some(name), Some(size), digest))
-        .unwrap_or((None, None, None, None));
-    Ok(AppUpdateInfo {
-        status: if is_newer_version(&latest_tag, &current_version) { "available".into() } else { "latest".into() },
-        latest_tag,
-        release_url: release.get("html_url").and_then(serde_json::Value::as_str).unwrap_or("https://github.com/Crvesoft/CookLLM/releases").to_string(),
-        release_notes: release.get("body").and_then(serde_json::Value::as_str).map(str::to_string).filter(|text| !text.trim().is_empty()),
-        asset_url, asset_name, asset_size, asset_sha256,
-        install_kind, install_supported, install_reason,
-    })
-}
-
-#[tauri::command]
-async fn check_app_update(app: AppHandle) -> Result<AppUpdateInfo, String> {
-    tauri::async_runtime::spawn_blocking(move || check_app_update_impl(&app)).await.map_err(|error| format!("应用更新检查任务中断：{}", error))?
-}
-
-fn installer_digest(path: &Path) -> Result<String, String> {
-    use sha2::{Digest, Sha256};
-    let mut file = fs::File::open(path).map_err(|error| format!("读取安装包失败：{}", error))?;
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).map_err(|error| format!("计算安装包校验失败：{}", error))?;
-    Ok(hasher.finalize().iter().map(|byte| format!("{:02x}", byte)).collect())
-}
-
-fn verify_app_installer(path: &Path, expected_size: Option<u64>, expected_digest: Option<&str>) -> Result<(), String> {
-    let metadata = fs::metadata(path).map_err(|error| format!("安装包校验失败：{}", error))?;
-    if metadata.len() == 0 { return Err("安装包为空".into()); }
-    if let Some(size) = expected_size.filter(|size| *size > 0) {
-        if metadata.len() != size { return Err(format!("安装包大小校验失败：期望 {} 字节，实际 {} 字节", size, metadata.len())); }
-    }
-    if let Some(expected) = expected_digest.filter(|digest| !digest.trim().is_empty()) {
-        if !installer_digest(path)?.eq_ignore_ascii_case(expected.trim()) { return Err("安装包 SHA-256 校验失败".into()); }
-    }
-    Ok(())
-}
-
-fn automatic_install_gate() -> Result<(), String> {
-    if cfg!(target_os = "linux") { Err("Linux 自动下载与安装尚未开放（阶段 3），请使用已有本地引擎或发布页面".into()) } else { Ok(()) }
-}
-
-fn download_app_update_impl(app: AppHandle, url: String, file_name: String, expected_size: Option<u64>, expected_sha256: Option<String>) -> Result<String, String> {
-    if cfg!(target_os = "linux") {
-        #[cfg(target_os = "linux")]
-        return linux_app_update::download(app, url, file_name);
-    }
-    automatic_install_gate()?;
-    let normalized = url.trim().to_string();
-    let parsed = reqwest::Url::parse(&normalized).map_err(|_| "安装包下载地址无效".to_string())?;
-    if parsed.scheme() != "https" || parsed.host_str() != Some("github.com") || !parsed.path().contains("/releases/download/") {
-        return Err("安装包下载地址不受信任".into());
-    }
-    let safe_name = file_name.trim();
-    let safe_self = Path::new(safe_name).file_name().and_then(|value| value.to_str()).unwrap_or("");
-    if safe_name != safe_self || !(safe_name.to_lowercase().ends_with(".exe") || safe_name.to_lowercase().ends_with(".msi")) {
-        return Err("安装包文件名无效".into());
-    }
-    let directory = std::env::temp_dir().join("CookLLM");
-    fs::create_dir_all(&directory).map_err(|error| format!("创建更新临时目录失败：{}", error))?;
-    let destination = directory.join(safe_name);
-    if destination.exists() && verify_app_installer(&destination, expected_size, expected_sha256.as_deref()).is_ok() {
-        emit_download_progress(&app, "done", 100, expected_size.unwrap_or(0), expected_size.unwrap_or(0), 0, "安装包已就绪");
-        return Ok(destination.to_string_lossy().to_string());
-    }
-    let temporary = destination.with_extension(format!("part.{}", now_ms()));
-    // 应用自更新链路：持有 RAII 守卫，任何退出路径自动复位自己的取消标志
-    let cancel = CancelFlag(&APP_UPDATE_CANCEL);
-    let _guard = CancelGuard(cancel);
-    let client = build_net_client(&read_config(&app)?.network.clone().unwrap_or_default())?;
-    let download_result = stream_download_with_fallback(cancel, &client, &normalized, &temporary, &app);
-    if let Err(error) = download_result {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    verify_app_installer(&temporary, expected_size, expected_sha256.as_deref())?;
-    if destination.exists() {
-        fs::remove_file(&destination).map_err(|error| format!("替换旧安装包失败：{}", error))?;
-    }
-    fs::rename(&temporary, &destination).map_err(|error| format!("保存安装包失败：{}", error))?;
-    emit_download_progress(&app, "done", 100, expected_size.unwrap_or(0), expected_size.unwrap_or(0), 0, "安装包已就绪");
-    Ok(destination.to_string_lossy().to_string())
-}
-
-#[tauri::command]
-async fn download_app_update(app: AppHandle, url: String, file_name: String, size: Option<u64>, sha256: Option<String>) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || download_app_update_impl(app, url, file_name, size, sha256))
-        .await.map_err(|error| format!("应用更新下载任务中断：{}", error))?
-}
-
-#[tauri::command]
-fn cancel_app_update() -> Result<(), String> {
-    CancelFlag(&APP_UPDATE_CANCEL).cancel();
-    Ok(())
-}
-
-#[tauri::command]
-fn install_app_update(app: AppHandle, path: String) -> Result<Option<AppInstallResult>, String> {
-    if cfg!(target_os = "linux") {
-        #[cfg(target_os = "linux")]
-        return linux_app_update::install(&app, &path);
-    }
-    automatic_install_gate()?;
-    let installer = PathBuf::from(&path);
-    let allowed_parent = std::env::temp_dir().join("CookLLM");
-    if !installer.starts_with(&allowed_parent) || !installer.is_file() || !(path.to_lowercase().ends_with(".exe") || path.to_lowercase().ends_with(".msi")) {
-        return Err("安装包无效".into());
-    }
-    if fs::metadata(&installer).map(|metadata| metadata.len()).unwrap_or(0) == 0 { return Err("安装包为空".into()); }
-    // 升级退出前确保杀死当前运行中的 llama-server，防止更新后残留进程占用显存
-    let state = app.state::<ProcessState>();
-    if let Ok(mut guard) = state.0.lock() {
-        if let Some(managed) = guard.as_mut() {
-            kill_managed_child(managed)?;
-            *guard = None;
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        if path.to_lowercase().ends_with(".msi") {
-            Command::new("msiexec").arg("/i").arg(&installer).creation_flags(0x00000208).spawn().map_err(|error| format!("启动安装程序失败：{}", error))?;
-        } else {
-            Command::new(&installer).creation_flags(0x00000208).spawn().map_err(|error| format!("启动安装程序失败：{}", error))?;
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    let _ = Command::new(&installer).spawn();
-    std::thread::sleep(std::time::Duration::from_millis(400));
-    app.cleanup_before_exit();
-    app.exit(0);
-    Ok(None)
-}
-
-/// 解析 Windows x64 的 llama.cpp 资产（llama-bXXXX-bin-win-{cuda|vulkan|avx2}.zip）。
-fn parse_win_assets(value: &serde_json::Value) -> Vec<LlamaCppAsset> {
-    let mut out = Vec::new();
-    let Some(assets) = value.get("assets").and_then(|value| value.as_array()) else {
-        return out;
-    };
-    for item in assets {
-        let name = item.get("name").and_then(|value| value.as_str()).unwrap_or_default();
-        let lower = name.to_lowercase();
-        // 仅匹配官方 llama-bXXXX-bin-win-*.zip（排除 cudart- 纯运行时包 / arm64 / 其他平台）
-        if !lower.starts_with("llama-") || !lower.contains("-bin-win-") || !lower.ends_with(".zip") {
-            continue;
-        }
-        if lower.contains("arm64") || lower.contains("-arm64") {
-            continue;
-        }
-        let url = item.get("browser_download_url").and_then(|value| value.as_str()).unwrap_or_default().to_string();
-        if url.is_empty() {
-            continue;
-        }
-        let size = item.get("size").and_then(|value| value.as_u64()).unwrap_or(0);
-        let backend = if lower.contains("win-cuda") { "cuda" } else if lower.contains("win-vulkan") { "vulkan" } else if lower.contains("win-cpu") || lower.contains("win-avx2") { "cpu" } else { continue };
-        let cuda_full_version = if backend == "cuda" { extract_cuda_full_version(&lower) } else { String::new() };
-        let cuda_version = if backend == "cuda" { extract_cuda_major_version(&cuda_full_version) } else { String::new() };
-        out.push(LlamaCppAsset { backend: backend.into(), cuda_version, cuda_full_version, file_name: name.to_string(), url, size, sha256: None });
-    }
-    out
-}
-
-/// 解析 CUDA 运行时包资产（cudart-llama-bin-win-cuda-X.Y-x64.zip，不含 llama-server，仅含 cudart dll）。
-fn parse_cudart_assets(value: &serde_json::Value) -> Vec<LlamaCppAsset> {
-    let mut out = Vec::new();
-    let Some(assets) = value.get("assets").and_then(|value| value.as_array()) else {
-        return out;
-    };
-    for item in assets {
-        let name = item.get("name").and_then(|value| value.as_str()).unwrap_or_default();
-        let lower = name.to_lowercase();
-        if !lower.starts_with("cudart-") || !lower.contains("-win-cuda-") || !lower.ends_with(".zip") {
-            continue;
-        }
-        if lower.contains("arm64") {
-            continue;
-        }
-        let url = item.get("browser_download_url").and_then(|value| value.as_str()).unwrap_or_default().to_string();
-        if url.is_empty() {
-            continue;
-        }
-        let size = item.get("size").and_then(|value| value.as_u64()).unwrap_or(0);
-        let cuda_full_version = extract_cuda_full_version(&lower);
-        let cuda_version = extract_cuda_major_version(&cuda_full_version);
-        out.push(LlamaCppAsset { backend: "cuda".into(), cuda_version, cuda_full_version, file_name: name.to_string(), url, size, sha256: None });
-    }
-    out
-}
-
-/// 根据主构建的 CUDA 完整版本匹配运行时包：优先精确版本，其次同主版本，最后任意 cuda。
-fn pick_cudart_asset<'a>(assets: &'a [LlamaCppAsset], cuda_full: &str) -> Option<&'a LlamaCppAsset> {
-    if cuda_full.is_empty() {
-        return assets.iter().find(|asset| asset.backend == "cuda");
-    }
-    let major = extract_cuda_major_version(cuda_full);
-    assets
-        .iter()
-        .find(|asset| asset.cuda_full_version == cuda_full)
-        .or_else(|| assets.iter().find(|asset| !major.is_empty() && asset.cuda_version == major))
-        .or_else(|| assets.iter().find(|asset| asset.backend == "cuda"))
-}
-
-/// 最新 release 无 Windows 资产时回退扫描最近 releases，找到第一个带资产者。
-fn fetch_latest_release_with_assets(client: &reqwest::blocking::Client) -> Result<(String, serde_json::Value), String> {
-    let latest_url = format!("{}/releases/latest", llama_api_base());
-    let first = fetch_github_release_with_fallback(client, &latest_url)?;
-    let tag = first.get("tag_name").and_then(|value| value.as_str()).unwrap_or_default().to_string();
-    if !parse_win_assets(&first).is_empty() {
-        return Ok((tag, first));
-    }
-    let list_url = format!("{}/releases?per_page=10", llama_api_base());
-    let list = fetch_github_release_with_fallback(client, &list_url)?;
-    if let Some(items) = list.as_array() {
-        for item in items {
-            if let Some(tag_value) = item.get("tag_name").and_then(|value| value.as_str()) {
-                if !parse_win_assets(item).is_empty() {
-                    return Ok((tag_value.to_string(), item.clone()));
-                }
-            }
-        }
-    }
-    Err("llama.cpp 最近发布中未找到 Windows 构建资产（可能网络异常或官方暂未发布）".into())
-}
-
-fn pick_asset<'a>(assets: &'a [LlamaCppAsset], backend: &'a str, cuda_version: &'a str) -> Option<&'a LlamaCppAsset> {
-    match backend {
-        "cuda" => {
-            // 指定了 CUDA 主版本则精确匹配；若传入 "13.4" 或 "13" 均能命中
-            let version = if cuda_version == "auto" || cuda_version.is_empty() { "12" } else { cuda_version };
-            let version_major = extract_cuda_major_version(version);
-            assets
-                .iter()
-                .find(|asset| {
-                    asset.backend == "cuda"
-                        && (asset.cuda_version == version
-                            || asset.cuda_full_version == version
-                            || (!version_major.is_empty() && (asset.cuda_version == version_major || asset.cuda_full_version.starts_with(&version_major))))
-                })
-                .or_else(|| {
-                    if cuda_version == "auto" || cuda_version.is_empty() {
-                        assets.iter().find(|asset| asset.backend == "cuda" && (asset.cuda_version == "13" || asset.cuda_full_version.starts_with("13")))
-                    } else {
+        match trimmed.parse::<Shortcut>() {
+            Ok(shortcut) => {
+                match gs.register(shortcut.clone()) {
+                    Ok(()) => Some(shortcut),
+                    Err(_e) => {
+                        eprintln!("注册快捷键 [{}] ({}) 失败: {}", _action_name, trimmed, _e);
                         None
                     }
-                })
-                .or_else(|| assets.iter().find(|asset| asset.backend == "cuda"))
+                }
+            }
+            Err(_e) => {
+                eprintln!("解析快捷键 [{}] ({}) 格式错误: {}", _action_name, trimmed, _e);
+                None
+            }
         }
-        "vulkan" => assets
-            .iter()
-            .find(|asset| asset.backend == "vulkan" && asset.file_name.to_lowercase().contains("x64"))
-            .or_else(|| assets.iter().find(|asset| asset.backend == "vulkan")),
-        _ => assets
-            .iter()
-            .find(|asset| {
-                let lower = asset.file_name.to_lowercase();
-                asset.backend == "cpu" && (lower.contains("cpu-x64") || lower.contains("avx2"))
-            })
-            .or_else(|| assets.iter().find(|asset| asset.backend == "cpu")),
+    };
+
+    if let Some(ref s) = sc.toggle_window {
+        registered.toggle_window = try_register(s, "后台打开主界面");
+    }
+    if let Some(ref s) = sc.start_server {
+        registered.start_server = try_register(s, "开启服务");
+    }
+    if let Some(ref s) = sc.stop_server {
+        registered.stop_server = try_register(s, "关闭服务");
+    }
+    if let Some(ref s) = sc.switch_engine {
+        registered.switch_engine = try_register(s, "打开引擎管理");
+    }
+
+    if let Ok(mut g) = get_registered_shortcuts().lock() {
+        *g = registered;
     }
 }
 
-/// 检查远程最新版本并匹配当前硬件后端对应的 Windows 资产（内部阻塞实现）。
-fn check_llamacpp_update_impl(app: &AppHandle, backend: Option<String>, cuda_version: Option<String>) -> Result<LlamaCppRelease, String> {
-    if cfg!(target_os = "linux") {
-        #[cfg(target_os = "linux")]
-        return linux_engine_update::check_update(app, backend, cuda_version);
+fn handle_global_shortcut(app: &AppHandle, shortcut: &Shortcut, event: ShortcutEvent) {
+    if event.state() != ShortcutState::Pressed {
+        return;
     }
-    automatic_install_gate()?;
-    let config = read_config(app)?;
-    let network = config.network.clone().unwrap_or_default();
-    let client = build_net_client(&network)?;
-    let (tag, value) = fetch_latest_release_with_assets(&client)?;
-    if tag.trim().is_empty() {
-        return Err("未获取到远程版本号".into());
-    }
-    let assets = parse_win_assets(&value);
-    let cudart_assets = parse_cudart_assets(&value);
-    let requested = backend.unwrap_or_else(|| detect_hardware().recommended_backend);
-    let matched = pick_asset(&assets, &requested, cuda_version.as_deref().unwrap_or("auto")).cloned();
-    Ok(LlamaCppRelease { tag, assets, cudart_assets, match_backend: requested, match_asset: matched })
-}
+    let (is_toggle, is_start, is_stop, is_switch_engine) = {
+        if let Ok(guard) = get_registered_shortcuts().lock() {
+            (
+                guard.toggle_window.as_ref() == Some(shortcut),
+                guard.start_server.as_ref() == Some(shortcut),
+                guard.stop_server.as_ref() == Some(shortcut),
+                guard.switch_engine.as_ref() == Some(shortcut),
+            )
+        } else {
+            (false, false, false, false)
+        }
+    };
 
-/// 检查远程最新版本并匹配当前硬件后端对应的 Windows 资产。
-#[tauri::command]
-async fn check_llamacpp_update(app: AppHandle, backend: Option<String>, cuda_version: Option<String>) -> Result<LlamaCppRelease, String> {
-    tauri::async_runtime::spawn_blocking(move || check_llamacpp_update_impl(&app, backend, cuda_version))
-        .await
-        .map_err(|error| format!("检查更新任务中断：{}", error))?
-}
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if is_toggle {
+            if let Some(window) = app.get_webview_window("main") {
+                let is_minimized = window.is_minimized().unwrap_or(false);
+                let is_visible = window.is_visible().unwrap_or(false);
+                let is_focused = window.is_focused().unwrap_or(false);
+                if !is_visible || is_minimized {
+                    show_window_onscreen(&window);
+                } else if is_focused {
+                    let _ = window.hide();
+                } else {
+                    show_window_onscreen(&window);
+                }
+            }
+        }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DownloadProgress {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source: Option<&'static str>,
-    phase: String,
-    percent: u32,
-    downloaded: u64,
-    total: u64,
-    speed_bps: u64,
-    message: String,
-}
+        if is_start {
+            let state = app.state::<ProcessState>();
+            let is_running = {
+                let guard = state.0.lock().ok();
+                guard.as_ref().map(|g| g.is_some()).unwrap_or(false)
+            };
+            if !is_running {
+                if let Ok(config) = read_config(&app) {
+                    if let Some((model_id, profile_id)) = resolve_default_model_and_profile(&config) {
+                        if let Err(err) = start_server_internal(&app, &state, &model_id, &profile_id) {
+                            emit_log(&app, "stderr", &format!("启动服务失败: {}", err));
+                        }
+                    }
+                }
+            }
+        }
 
-fn emit_download_progress(app: &AppHandle, phase: &str, percent: u32, downloaded: u64, total: u64, speed_bps: u64, message: impl Into<String>) {
-    let _ = app.emit("download-progress", DownloadProgress {
-        source: if cfg!(target_os = "linux") { Some("engine") } else { None },
-        phase: phase.into(),
-        percent: percent.min(100),
-        downloaded,
-        total,
-        speed_bps,
-        message: message.into(),
+        if is_stop {
+            let state = app.state::<ProcessState>();
+            let is_running = {
+                let guard = state.0.lock().ok();
+                guard.as_ref().map(|g| g.is_some()).unwrap_or(false)
+            };
+            if is_running {
+                let _ = stop_server_internal(&app, &state);
+            }
+        }
+
+        if is_switch_engine {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+            let _ = app.emit("shortcut-open-engine-hub", ());
+        }
     });
-}
-
-/// 流式下载并实时发送进度事件（download-progress），返回最终字节数。
-fn stream_download(cancel: CancelFlag, client: &reqwest::blocking::Client, url: &str, dest: &Path, app: &AppHandle) -> Result<u64, String> {
-    use std::io::Read as _;
-    use std::io::Write as _;
-    emit_download_progress(app, "download", 0, 0, 0, 0, "开始下载");
-    let mut response = client.get(url).timeout(std::time::Duration::from_secs(3600)).send().map_err(|error| format!("下载失败：{}", error))?;
-    if !response.status().is_success() {
-        return Err(format!("下载失败：HTTP {}", response.status()));
-    }
-    let total = response.content_length().unwrap_or(0);
-    let mut file = fs::File::create(dest).map_err(|error| format!("创建下载文件失败：{}", error))?;
-    let mut downloaded: u64 = 0;
-    let mut buffer = [0u8; 128 * 1024];
-    let start_ms = now_ms();
-    let mut last_emit_ms = start_ms;
-    let mut last_speed_ms = start_ms;
-    let mut last_speed_bytes = downloaded;
-    let mut current_speed: u64 = 0;
-    loop {
-        if cancel.cancelled() {
-            let _ = fs::remove_file(dest);
-            return Err("更新已取消".into());
-        }
-        let count = response.read(&mut buffer).map_err(|error| format!("下载中断：{}", error))?;
-        if count == 0 {
-            break;
-        }
-        file.write_all(&buffer[..count]).map_err(|error| format!("写入下载文件失败：{}", error))?;
-        downloaded += count as u64;
-        let now = now_ms();
-        let speed_dt = now.saturating_sub(last_speed_ms);
-        if speed_dt >= 500 {
-            let bytes_delta = downloaded.saturating_sub(last_speed_bytes);
-            let instant = bytes_delta * 1000 / speed_dt;
-            current_speed = if current_speed == 0 { instant } else { (current_speed * 3 + instant * 7) / 10 };
-            last_speed_ms = now;
-            last_speed_bytes = downloaded;
-        }
-        if now.saturating_sub(last_emit_ms) >= 200 {
-            let percent = if total > 0 { ((downloaded as f64 / total as f64) * 100.0) as u32 } else { 0 };
-            let downloaded_mb = (downloaded as f64) / (1024.0 * 1024.0);
-            let total_mb = (total as f64) / (1024.0 * 1024.0);
-            let size_msg = if total > 0 {
-                format!("{:.1} MB / {:.1} MB", downloaded_mb, total_mb)
-            } else {
-                format!("{:.1} MB", downloaded_mb)
-            };
-            emit_download_progress(app, "download", percent, downloaded, total, current_speed, size_msg);
-            last_emit_ms = now;
-        }
-    }
-    file.flush().map_err(|error| error.to_string())?;
-    emit_download_progress(app, "download", 100, downloaded, total, 0, "下载完成");
-    Ok(downloaded)
-}
-
-/// 流式下载多通道兜底：配置代理 → 直连 → 本机探测代理端口；失败时汇总各通道原因。
-fn stream_download_with_fallback(cancel: CancelFlag, client: &reqwest::blocking::Client, url: &str, dest: &Path, app: &AppHandle) -> Result<u64, String> {
-    let mut errors: Vec<String> = Vec::new();
-    match stream_download(cancel, client, url, dest, app) {
-        Ok(size) => return Ok(size),
-        Err(error) => errors.push(format!("配置代理通道：{}", error)),
-    }
-    emit_download_progress(app, "download", 0, 0, 0, 0, "代理通道失败，切换直连重试");
-    match stream_download(cancel, direct_client(), url, dest, app) {
-        Ok(size) => return Ok(size),
-        Err(error) => errors.push(format!("直连：{}", error)),
-    }
-    if let Some(proxy_url) = probe_local_proxy() {
-        match proxied_client(&proxy_url) {
-            Ok(proxied) => {
-                emit_download_progress(app, "download", 0, 0, 0, 0, format!("切换本地代理 {} 重试", proxy_url));
-                match stream_download(cancel, &proxied, url, dest, app) {
-                    Ok(size) => return Ok(size),
-                    Err(error) => errors.push(format!("本地代理 {}：{}", proxy_url, error)),
-                }
-            }
-            Err(error) => errors.push(format!("初始化本地代理 {} 失败：{}", proxy_url, error)),
-        }
-    }
-    Err(format!("下载失败（{}）", errors.join("；")))
-}
-
-/// 防止 zip 条目逃逸解压目录（拒绝绝对路径、.. 等）。
-fn safe_zip_path(base: &Path, name: &str) -> Result<PathBuf, String> {
-    use std::path::Component;
-    let mut out = base.to_path_buf();
-    for component in Path::new(name).components() {
-        match component {
-            Component::Normal(segment) => out.push(segment),
-            _ => return Err(format!("压缩包内含非法路径：{}", name)),
-        }
-    }
-    Ok(out)
-}
-
-/// 解压 zip 到目标目录，并逐条发送进度。
-fn extract_zip_archive(cancel: CancelFlag, zip_path: &Path, dest_dir: &Path, app: &AppHandle) -> Result<(), String> {
-    emit_download_progress(app, "extract", 0, 0, 0, 0, "开始解压");
-    let file = fs::File::open(zip_path).map_err(|error| format!("打开压缩包失败：{}", error))?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|error| format!("读取压缩包失败：{}", error))?;
-    let total_entries = archive.len();
-    for index in 0..total_entries {
-        if cancel.cancelled() {
-            return Err("更新已取消".into());
-        }
-        let mut entry = archive.by_index(index).map_err(|error| format!("读取压缩条目失败：{}", error))?;
-        let name = entry.name().to_string();
-        let out_path = safe_zip_path(dest_dir, &name)?;
-        if entry.is_dir() {
-            fs::create_dir_all(&out_path).map_err(|error| format!("创建目录失败：{}", error))?;
-            continue;
-        }
-        if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent).map_err(|error| format!("创建目录失败：{}", error))?;
-        }
-        let mut out = fs::File::create(&out_path).map_err(|error| format!("创建解压文件失败：{}", error))?;
-        std::io::copy(&mut entry, &mut out).map_err(|error| format!("解压写入失败：{}", error))?;
-        let percent = if total_entries > 0 { ((index + 1) as f64 / total_entries as f64 * 100.0) as u32 } else { 0 };
-        emit_download_progress(app, "extract", percent, index as u64 + 1, total_entries as u64, 0, name);
-    }
-    emit_download_progress(app, "extract", 100, total_entries as u64, total_entries as u64, 0, "解压完成");
-    Ok(())
-}
-
-/// 原子替换 llamacpp 目录：旧目录先改名备份，新目录 rename 到位，成功后删除备份。
-fn install_bin_dir(bin_dir: &Path, target: &Path, version: &str, backend: &str) -> Result<(), String> {
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    let backup = target.with_extension(format!("old-{}", now_ms()));
-    if target.exists() {
-        fs::rename(target, &backup).map_err(|error| format!("备份旧安装目录失败：{}", error))?;
-    }
-    if let Err(error) = fs::rename(bin_dir, target) {
-        if backup.exists() {
-            let _ = fs::rename(&backup, target);
-        }
-        return Err(format!("原子替换安装目录失败（可能 llama-server 仍在运行占用文件）：{}", error));
-    }
-    // 保留旧目录中目标目录缺失的 DLL（如 cudart 等 CUDA 运行时）及元数据文件，best effort
-    if backup.exists() {
-        if let Ok(entries) = fs::read_dir(&backup) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let is_dll = path.extension().map(|ext| ext.eq_ignore_ascii_case("dll")).unwrap_or(false);
-                let is_cuda_meta = path.file_name().map(|n| n == "cuda_version.txt").unwrap_or(false);
-                if (!is_dll && !is_cuda_meta) || !path.is_file() {
-                    continue;
-                }
-                let name = path.file_name().unwrap_or_default();
-                let dest = target.join(name);
-                if !dest.exists() {
-                    let _ = fs::copy(&path, &dest);
-                }
-            }
-        }
-        let _ = fs::remove_dir_all(&backup);
-    }
-    if !version.trim().is_empty() {
-        let _ = fs::write(target.join("version.txt"), format!("{}
-", version.trim()));
-    }
-    let _ = fs::write(target.join("backend.txt"), format!("{}
-", backend));
-    Ok(())
-}
-
-/// 更新任务取消标志（按链路独立）：「应用自更新」与「llama.cpp 引擎更新」各持一个，
-/// 取消任何一边都不会误杀另一边正在进行下载 / 解压。
-static APP_UPDATE_CANCEL: AtomicBool = AtomicBool::new(false);
-static LLAMACPP_UPDATE_CANCEL: AtomicBool = AtomicBool::new(false);
-
-/// 指向某条链路取消标志的句柄，随调用参数传递给下载 / 解压循环。
-#[derive(Clone, Copy)]
-struct CancelFlag(&'static AtomicBool);
-impl CancelFlag {
-    fn cancelled(self) -> bool { self.0.load(Ordering::Relaxed) }
-    fn cancel(self) { self.0.store(true, Ordering::Relaxed) }
-    fn reset(self) { self.0.store(false, Ordering::Relaxed) }
-}
-
-/// RAII：任务函数持有后无论成功 / 失败 / 提前返回，离开作用域都自动复位标志，
-/// 取代失败分支里成串的手动 `store(false)`。
-struct CancelGuard(CancelFlag);
-impl Drop for CancelGuard {
-    fn drop(&mut self) { self.0.reset(); }
-}
-
-/// 取消正在进行的 llama.cpp 更新（下载 / 解压阶段）。
-#[tauri::command]
-fn cancel_llamacpp_update() -> Result<(), String> {
-    CancelFlag(&LLAMACPP_UPDATE_CANCEL).cancel();
-    Ok(())
-}
-
-/// 一键更新 / 重新安装 llama.cpp（内部阻塞实现）。
-fn download_llamacpp_impl(app: AppHandle, backend: String, cuda_version: Option<String>, asset_url: Option<String>, asset_name: Option<String>, tag: Option<String>) -> Result<String, String> {
-    if cfg!(target_os = "linux") {
-        #[cfg(target_os = "linux")]
-        return linux_engine_update::download(app, backend, cuda_version, asset_url, asset_name, tag);
-    }
-    automatic_install_gate()?;
-    // 引擎更新链路：RAII 守卫负责在任何退出路径复位取消标志（只影响本链路，不波及应用自更新）
-    let cancel = CancelFlag(&LLAMACPP_UPDATE_CANCEL);
-    let _guard = CancelGuard(cancel);
-    // 1) 确认主程序（托管中的 llama-server）未在运行
-    {
-        let state = app.state::<ProcessState>();
-        let mut guard = state.0.lock().map_err(|_| "进程状态锁已损坏".to_string())?;
-        if let Some(managed) = guard.as_mut() {
-            let still_running = !managed_child_exited(managed).unwrap_or(false);
-            if still_running {
-                return Err("llama-server 正在运行，请先在顶部停止服务后再更新引擎".into());
-            }
-        }
-    }
-    let config = read_config(&app)?;
-    let network = config.network.clone().unwrap_or_default();
-    let target = llamacpp_root(&app, &config)?;
-
-    // 2) 解析下载资产（未指定则按后端自动匹配）
-    let (download_url, file_name, version, cuda_full, cudart_url, cudart_name) = match (asset_url, asset_name) {
-        (Some(url), Some(name)) => (url, name, tag.unwrap_or_default(), String::new(), String::new(), String::new()),
-        _ => {
-            let release = check_llamacpp_update_impl(&app, Some(backend.clone()), cuda_version.clone())?;
-            let asset = release.match_asset.ok_or_else(|| format!("未找到 {backend} 后端的 Windows 构建资产，请检查网络或更换后端"))?;
-            // cuda 后端需要配套的 cudart 运行时包
-            let (cudart_url, cudart_name) = if backend == "cuda" {
-                let picked = pick_cudart_asset(&release.cudart_assets, &asset.cuda_full_version);
-                picked.map(|item| (item.url.clone(), item.file_name.clone())).unwrap_or_default()
-            } else {
-                (String::new(), String::new())
-            };
-            (asset.url, asset.file_name, release.tag, asset.cuda_full_version.clone(), cudart_url, cudart_name)
-        }
-    };
-
-    // 3) 临时目录：与目标安装目录同卷（避免跨盘 rename 失败，保证安装阶段原子重命名可执行）
-    let target_parent = target.parent().map(Path::to_path_buf).unwrap_or_else(|| target.clone());
-    let temp_root = target_parent.join(".llamacpp_tmp");
-    fs::create_dir_all(&temp_root).map_err(|error| format!("创建临时目录失败：{}", error))?;
-    let zip_path = temp_root.join(&file_name);
-    let extract_dir = temp_root.join("extract");
-    if extract_dir.exists() {
-        fs::remove_dir_all(&extract_dir).map_err(|error| error.to_string())?;
-    }
-    fs::create_dir_all(&extract_dir).map_err(|error| error.to_string())?;
-
-    // 4) 下载 + 解压（取消 / 失败时清理临时文件）
-    let client = build_net_client(&network)?;
-    if let Err(error) = stream_download_with_fallback(cancel, &client, &download_url, &zip_path, &app) {
-        let _ = fs::remove_file(&zip_path);
-        let _ = fs::remove_dir_all(&temp_root);
-        return Err(error);
-    }
-    if let Err(error) = extract_zip_archive(cancel, &zip_path, &extract_dir, &app) {
-        let _ = fs::remove_file(&zip_path);
-        let _ = fs::remove_dir_all(&temp_root);
-        return Err(error);
-    }
-
-    // 4.5) cuda 后端：检查是否需要配套的 cudart 运行时包。
-    // 若当前安装目录中已具备同主版本且完整的 CUDA 运行时 DLL（如 cudart64_12.dll + cublas64_12.dll），
-    // 且 CUDA 版本未发生变化，则无需重新下载与解压 CUDA 运行时包，直接复用现有环境！
-    if backend == "cuda" && !cudart_url.is_empty() && !cudart_name.is_empty() {
-        let target_cuda_major = if !cuda_full.is_empty() {
-            extract_cuda_major_version(&cuda_full)
-        } else {
-            extract_cuda_major_version(&file_name)
-        };
-
-        let installed_cuda = get_installed_cuda_version(&target);
-        let runtime_complete = !target_cuda_major.is_empty() && is_cuda_runtime_complete(&target, &target_cuda_major);
-        let same_version = installed_cuda
-            .as_deref()
-            .map(|v| extract_cuda_major_version(v) == target_cuda_major)
-            .unwrap_or(false);
-
-        if runtime_complete && same_version {
-            let display_ver = if !cuda_full.is_empty() { cuda_full.as_str() } else { target_cuda_major.as_str() };
-            emit_download_progress(&app, "install", 0, 0, 0, 0, format!("检测到已有完整的 CUDA {} 运行时且未发生变更，复用现有环境，跳过下载", display_ver));
-        } else {
-            let cache_dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("llamacpp_cache");
-            fs::create_dir_all(&cache_dir).map_err(|e| format!("创建 CUDA 缓存目录失败：{}", e))?;
-            let cached_zip = cache_dir.join(&cudart_name);
-            let mut need_download = false;
-            if cached_zip.exists() {
-                emit_download_progress(&app, "extract", 0, 0, 0, 0, format!("使用本地缓存的 CUDA 运行时 {}", cudart_name));
-                if let Err(_error) = extract_zip_archive(cancel, &cached_zip, &extract_dir, &app) {
-                    // 缓存损坏：删除后重新下载
-                    let _ = fs::remove_file(&cached_zip);
-                    need_download = true;
-                }
-            } else {
-                need_download = true;
-            }
-            if need_download {
-                emit_download_progress(&app, "download", 0, 0, 0, 0, format!("正在下载 CUDA 运行时 {}", cudart_name));
-                if let Err(error) = stream_download_with_fallback(cancel, &client, &cudart_url, &cached_zip, &app) {
-                    let _ = fs::remove_file(&cached_zip);
-                    let _ = fs::remove_dir_all(&temp_root);
-                    return Err(format!("下载 CUDA 运行时失败：{}", error));
-                }
-                if let Err(error) = extract_zip_archive(cancel, &cached_zip, &extract_dir, &app) {
-                    let _ = fs::remove_file(&cached_zip);
-                    let _ = fs::remove_dir_all(&temp_root);
-                    return Err(format!("解压 CUDA 运行时失败：{}", error));
-                }
-            }
-        }
-    }
-
-    // 5) 定位解压后的 llama-server 可执行文件
-    let located = match find_executable(&extract_dir, llama_exe_name(), 0) {
-        Some(path) => path,
-        None => {
-            let _ = fs::remove_dir_all(&temp_root);
-            return Err("压缩包中未找到 llama-server（可能是 cudart 运行时包或其他平台构建），已清理临时文件".into());
-        }
-    };
-    let bin_dir = located.parent().ok_or("解压内容异常".to_string())?.to_path_buf();
-    // cuda 后端：把 cudart 包内的 dll 拍平到与 llama-server 同级，确保启动时能找到 CUDA 运行时
-    if backend == "cuda" {
-        flatten_dlls(&extract_dir, &bin_dir);
-    }
-
-    // 6) 原子替换安装目录
-    emit_download_progress(&app, "install", 0, 0, 0, 0, "正在覆盖安装");
-    if let Err(error) = install_bin_dir(&bin_dir, &target, &version, &backend) {
-        let _ = fs::remove_dir_all(&temp_root);
-        return Err(error);
-    }
-    if backend == "cuda" && !cuda_full.is_empty() {
-        let _ = fs::write(target.join("cuda_version.txt"), format!("{}\n", cuda_full));
-    }
-
-    // 7) 更新配置：serverPath 指向新引擎，并持久化安装目录；若当前在多分支中，同步更新该分支信息
-    let new_server_path = find_executable(&target, llama_exe_name(), 0)
-        .ok_or("安装后未找到 llama-server.exe".to_string())?;
-    let mut updated = read_config(&app)?;
-    let new_path_str = new_server_path.to_string_lossy().to_string();
-    updated.server_path = new_path_str.clone();
-    updated.llamacpp_dir = Some(target.to_string_lossy().to_string());
-    updated.llama_backend = Some(backend.clone());
-    if backend == "cuda" {
-        if !cuda_full.is_empty() {
-            updated.llama_cuda_version = Some(cuda_full.clone());
-        } else if let Some(v) = cuda_version.as_ref() {
-            updated.llama_cuda_version = Some(v.clone());
-        }
-    }
-    let saved_cuda_ver = if backend == "cuda" {
-        if !cuda_full.is_empty() {
-            Some(cuda_full.clone())
-        } else {
-            get_installed_cuda_version(&target)
-        }
-    } else {
-        None
-    };
-    if let Some(active_id) = updated.active_engine_id.as_ref() {
-        if let Some(active_eng) = updated.engines.iter_mut().find(|e| &e.id == active_id) {
-            active_eng.path = new_path_str.clone();
-            active_eng.backend = Some(backend.clone());
-            active_eng.cuda_version = saved_cuda_ver.clone();
-            active_eng.version = Some(version.clone());
-        }
-    } else if !updated.engines.is_empty() {
-        updated.engines[0].path = new_path_str.clone();
-        updated.engines[0].backend = Some(backend.clone());
-        updated.engines[0].cuda_version = saved_cuda_ver;
-        updated.engines[0].version = Some(version.clone());
-    }
-    save_config(app.clone(), updated)?;
-
-    // 8) 清理临时的下载与解压文件
-    let _ = fs::remove_file(&zip_path);
-    let _ = fs::remove_dir_all(&temp_root);
-    emit_download_progress(&app, "done", 100, 0, 0, 0, "更新完成");
-    Ok(new_server_path.to_string_lossy().to_string())
-}
-
-/// 一键更新 / 重新安装 llama.cpp：检查服务未运行 -> 解析资产 -> 下载 -> 解压 -> 原子替换 -> 更新配置。
-#[tauri::command]
-async fn download_llamacpp(app: AppHandle, backend: String, cuda_version: Option<String>, asset_url: Option<String>, asset_name: Option<String>, tag: Option<String>) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || download_llamacpp_impl(app, backend, cuda_version, asset_url, asset_name, tag))
-        .await
-        .map_err(|error| format!("更新任务中断：{}", error))?
 }
 
 
 
 #[cfg(test)]
 mod tests {
-    use super::find_executable;
+    use crate::engines::find_executable;
     use std::fs;
 
+    /// 跨平台引擎夹具名：Windows 需要 .exe 后缀，Linux 直接使用无后缀名。
     fn fixture_name(stem: &str) -> String {
         if cfg!(windows) { format!("{stem}.exe") } else { stem.to_string() }
     }
 
+    /// 写入一个「可被平台校验通过」的引擎夹具：Linux 下必须是带有效 shebang 的可执行文件。
     fn write_engine(path: &std::path::Path) {
         fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
         #[cfg(unix)]
@@ -5565,7 +1930,7 @@ mod tests {
 
     #[test]
     fn find_server_executable_finds_branch_server() {
-        use super::find_server_executable;
+        use crate::engines::find_server_executable;
         let base = fixture_dir("find_branch");
         fs::create_dir_all(base.join("bin")).unwrap();
         let name = fixture_name("llama-kvmem-server");
@@ -5577,11 +1942,13 @@ mod tests {
 
     #[test]
     fn collect_server_candidates_filters_rpc_server() {
-        use super::collect_server_candidates;
+        use crate::engines::collect_server_candidates;
         let base = fixture_dir("collect_rpc");
+        // 模拟官方包：同时存在 llama-server 与 ggml-rpc-server
         for stem in ["llama-server", "ggml-rpc-server", "llama-cli"] {
             write_engine(&base.join(fixture_name(stem)));
         }
+
         let mut candidates = Vec::new();
         collect_server_candidates(&base, &base, 0, &mut candidates);
         assert_eq!(candidates.len(), 1, "RPC 和 CLI 必须被排除，仅保留标准 server");
@@ -5591,7 +1958,7 @@ mod tests {
 
     #[test]
     fn extract_cuda_version_patterns() {
-        use super::{extract_cuda_full_version, extract_cuda_major_version};
+        use crate::system::{extract_cuda_full_version, extract_cuda_major_version};
         assert_eq!(extract_cuda_full_version("llama-b11149-bin-win-cuda-12.4-x64.zip"), "12.4");
         assert_eq!(extract_cuda_major_version("12.4"), "12");
 
@@ -5606,6 +1973,46 @@ mod tests {
 
         assert_eq!(extract_cuda_full_version("llama-b11149-bin-win-vulkan-x64.zip"), "");
     }
+
+    #[test]
+    fn ninfer_quant_extraction_tests() {
+        use crate::downloads::{extract_primary_quant_bits, extract_quant_bits_set};
+
+        // 1-bit: Ternary / Bonsai / 1.58bit
+        let s1 = vec!["sanbanfu/Ternary-Bonsai-2-27B-ninfer-v3-spliced.ninfer".into()];
+        let b1 = extract_quant_bits_set(&s1);
+        assert!(b1.contains(&1), "Ternary should match 1-bit");
+        assert!(!b1.contains(&8), "Ternary 1.58bit should not falsely match 8-bit");
+
+        // 2-bit & 3-bit: Swift-1.5 多量化
+        let s2 = vec![
+            "fyb423/Swift-1.5-Qwen3.8-27B-GSQ-RCO-NInfer".into(),
+            "iq2_s".into(),
+            "iq3_s".into(),
+            "iq3_xxs".into(),
+        ];
+        let b2 = extract_quant_bits_set(&s2);
+        assert!(b2.contains(&2), "Should match 2-bit");
+        assert!(b2.contains(&3), "Should match 3-bit (IQ3 and GSQ)");
+
+        // 4-bit: NVFP4
+        let s3 = vec![
+            "LittleStar888/qwen3_8_27b_nvfp4.ninfer".into(),
+            "nvfp4".into(),
+            "w4a4".into(),
+        ];
+        let b3 = extract_quant_bits_set(&s3);
+        assert!(b3.contains(&4), "NVFP4/W4A4 should match 4-bit");
+        assert_eq!(extract_primary_quant_bits(&s3), Some(4));
+
+        // 16-bit: BF16
+        let s4 = vec![
+            "ByronLeeee/Xiaomi-OCR-0-Ninfer".into(),
+            "bf16".into(),
+        ];
+        let b4 = extract_quant_bits_set(&s4);
+        assert!(b4.contains(&16), "BF16 should match 16-bit");
+    }
 }
 
 pub fn run() {
@@ -5613,9 +2020,7 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.unminimize();
-                let _ = window.set_focus();
+                show_window_onscreen(&window);
             }
         }))
         .plugin(tauri_plugin_dialog::init())
@@ -5630,12 +2035,20 @@ pub fn run() {
             react_mounted_ms: None,
             reported: false,
         })))
-        .invoke_handler(tauri::generate_handler![hf_trending, hf_search, hf_list_files, hf_whoami, hf_avatar, hf_download, hf_download_url, hf_cancel_download, hf_pause_download, hf_clear_download, remove_local_file, reveal_in_folder, get_models_dir, pick_models_dir, load_config, save_config, start_server, stop_server, get_server_status, check_orphan_server, kill_orphan_server, get_gpu_stats, get_gpu_info, hardware_info, detect_hardware, test_proxy_connection, get_system_proxy, get_llamacpp_status, check_llamacpp_update, download_llamacpp, cancel_llamacpp_update, check_app_update, download_app_update, cancel_app_update, install_app_update, pick_files, pick_folder, pick_server_dir, pick_server_file, expand_paths, inspect_gguf, paths_exist, export_config_backup, pick_config_backup, open_url, open_config_dir, clipboard_write, set_window_theme, show_main_window, report_startup_timing])
+        .invoke_handler(tauri::generate_handler![downloads::hf_trending, downloads::hf_search, downloads::hf_list_files, downloads::hf_whoami, downloads::hf_avatar, downloads::hf_download, downloads::hf_download_url, downloads::hf_cancel_download, downloads::hf_pause_download, downloads::hf_clear_download, downloads::ms_trending, downloads::ms_search, downloads::ms_list_files, downloads::ms_avatar, downloads::ms_download, downloads::remove_local_file, downloads::reveal_in_folder, downloads::get_models_dir, downloads::pick_models_dir, config::load_config, config::save_config, process::start_server, process::stop_server, process::get_server_status, process::check_orphan_server, process::kill_orphan_server, system::get_gpu_stats, system::get_gpu_info, system::hardware_info, system::detect_hardware, system::test_proxy_connection, system::get_system_proxy, engines::get_llamacpp_status, engines::check_llamacpp_update, engines::download_llamacpp, engines::cancel_llamacpp_update, app_update::check_app_update, app_update::download_app_update, app_update::cancel_app_update, app_update::install_app_update, process::read_ninfer_request_log, pick_files, pick_folder, engines::pick_server_dir, engines::pick_server_file, expand_paths, inspect_gguf, paths_exist, config::export_config_backup, config::pick_config_backup, pick_directory, open_url, open_config_dir, clipboard_write, set_window_theme, show_main_window, report_startup_timing, set_shortcuts_recording_mode])
         .setup(|app| {
+            app.handle().plugin(
+                tauri_plugin_global_shortcut::Builder::new()
+                    .with_handler(handle_global_shortcut)
+                    .build(),
+            )?;
             configure_main_window(app)?;
             if let Err(error) = setup_tray(app) {
                 eprintln!("托盘创建失败，保留主窗口：{error}");
                 if let Some(window) = app.get_webview_window("main") { window.show()?; }
+            }
+            if let Ok(config) = read_config(app.handle()) {
+                sync_global_shortcuts(app.handle(), &config);
             }
             Ok(())
         });

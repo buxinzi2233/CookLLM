@@ -1,69 +1,46 @@
 import {
-  AlertCircle,
-  ArrowDown,
   Check,
   ChevronDown,
-  ChevronLeft,
   ChevronRight,
-  Clock,
   Compass,
-  Database,
   Download,
   EllipsisVertical,
-  ExternalLink,
-  FileText,
   Flame,
-  FolderOpen,
   Globe,
-  KeyRound,
   ListChecks,
   Loader2,
   Pause,
   Play,
   RefreshCw,
   Search,
-  SlidersHorizontal,
-  Star,
   Trash2,
   X,
 } from "lucide-react";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import ConfirmModal from "./ConfirmModal";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
-import { hfAvatar, hfListFiles, hfSearch, hfTrending, openExternal, type FormatFilter } from "../tauri";
-import type { AppConfig, DiskUsage, HfFile, HfModel, ModelDownloadProgress } from "../types";
-import { cn, formatBytes, fileName, humanSpeed } from "../utils";
-
-/** 模型仓库的 HF 许可协议签署页（gated 模型无访问权限时引导用户前往同意）。 */
-function hfLicenseUrl(repo: string): string {
-  const id = repo.trim().replace(/\/+$/, "");
-  return `https://huggingface.co/${id}`;
-}
-
-export interface ActiveDownload {
-  /** 任务唯一标识（新建任务即生成，取消 / 暂停 / 删除 / 恢复都按它精确命中单个任务） */
-  taskId: string;
-  /** 关联仓库（直链下载为 "direct-url"） */
-  repo: string;
-  file: string;
-  sizeBytes: number;
-  startedAt: number;
-  status: "active" | "done" | "error" | "cancelled";
-  percent?: number;
-  downloaded?: number;
-  total?: number;
-  speedBps?: number;
-  /** 完成 / 失败时的本地完整路径 */
-  path?: string;
-  /** 失败时的错误信息 */
-  error?: string;
-  /** 失败时的错误类型（用于任务卡片的闭环引导：needs-token / no-permission） */
-  errorKind?: "needs-token" | "no-permission";
-  /** 完成时间戳 */
-  finishedAt?: number;
-  /** 直链任务保留原始 URL（恢复 / 重试时重新发起） */
-  url?: string;
-}
+import { hfListFiles, hfSearch, hfTrending, msListFiles, msSearch, msTrending, type FormatFilter } from "../tauri";
+import type { ActiveDownload, AppConfig, CommunitySource, DiskUsage, HfFile, HfModel, ModelDownloadProgress } from "../types";
+import { cn, formatBytes, humanSpeed } from "../utils";
+import ConfirmModal from "./ConfirmModal";
+import { ModelScopeLogo } from "./explore/ModelAvatar";
+import FacetSidebar from "./explore/FacetSidebar";
+import FileModal from "./explore/FileModal";
+import ModelRow from "./explore/ModelRow";
+import TaskCardActive from "./explore/TaskCardActive";
+import TaskCardDone from "./explore/TaskCardDone";
+import TaskCardFailed from "./explore/TaskCardFailed";
+import {
+  FAMILIES,
+  HF_SORT,
+  MS_SORT,
+  PARAM_LAST_INDEX,
+  PARAM_SLIDER_LABELS,
+  TASKS,
+  modelQuantBits,
+  type FamilyKey,
+  type SortKey,
+  type TaskKey,
+} from "./explore/modelUtils";
 
 interface Props {
   visible: boolean;
@@ -73,7 +50,7 @@ interface Props {
   onLog: (line: string, stream?: "stdout" | "stderr" | "system") => void;
   diskUsage: DiskUsage | null;
   onPickModelsDir: () => Promise<void>;
-  onDownload: (repo: string, file: string, sizeBytes: number) => void;
+  onDownload: (repo: string, file: string, sizeBytes: number, source?: CommunitySource) => void;
   activeDownloads: ActiveDownload[];
   progressMap: Record<string, ModelDownloadProgress>;
   /** 单任务暂停：仅中止该 taskId 的下载 */
@@ -94,494 +71,19 @@ interface Props {
   onGoSettings: () => void;
 }
 
-/* ---------------- 刻面筛选定义 ---------------- */
-
-type FamilyKey = "all" | "qwen" | "llama" | "deepseek" | "glm" | "gemma" | "mistral" | "code";
-type QuantKey = "all" | "q1" | "q2" | "q3" | "q4" | "q5" | "q6" | "q8" | "q16";
-type TaskKey = "chat" | "code" | "vision" | "reasoning";
-
-const FAMILIES: Array<{ key: FamilyKey; label: string; needles: string[] }> = [
-  { key: "all", label: "explore.filterAll", needles: [] },
-  { key: "qwen", label: "Qwen", needles: ["qwen"] },
-  { key: "llama", label: "Llama", needles: ["llama"] },
-  { key: "deepseek", label: "DeepSeek", needles: ["deepseek"] },
-  { key: "glm", label: "GLM", needles: ["glm"] },
-  { key: "gemma", label: "Gemma", needles: ["gemma"] },
-  { key: "mistral", label: "Mistral", needles: ["mistral", "mixtral", "codestral"] },
-  { key: "code", label: "explore.facetFamilyCode", needles: ["code", "coder", "starcoder"] },
-];
-
-const TASKS: Array<{ key: TaskKey; label: string; needles: string[] }> = [
-  { key: "chat", label: "explore.facetTaskChat", needles: ["chat", "conversation", "text-generation", "instruct", "general", "alpaca"] },
-  { key: "code", label: "explore.facetTaskCode", needles: ["code", "coder", "coding", "starcoder"] },
-  { key: "vision", label: "explore.facetTaskVision", needles: ["vision", "multimodal", "vl", "mmproj", "image", "audio"] },
-  { key: "reasoning", label: "explore.facetTaskReasoning", needles: ["reasoning", "r1", "cot", "think", "deepseek-r1"] },
-];
-
-const QUANTS: Array<{ key: QuantKey; label: string; bits: number[]; cls: string }> = [
-  { key: "q1", label: "explore.quantBit1", bits: [1], cls: "quant-1" },
-  { key: "q2", label: "explore.quantBit2", bits: [2], cls: "quant-2" },
-  { key: "q3", label: "explore.quantBit3", bits: [3], cls: "quant-3" },
-  { key: "q4", label: "explore.quantBit4", bits: [4], cls: "quant-4" },
-  { key: "q5", label: "explore.quantBit5", bits: [5], cls: "quant-5" },
-  { key: "q6", label: "explore.quantBit6", bits: [6], cls: "quant-6" },
-  { key: "q8", label: "explore.quantBit8", bits: [8], cls: "quant-8" },
-  { key: "q16", label: "explore.quantBit16", bits: [16], cls: "quant-16" },
-];
-
-const PARAM_SLIDER_LABELS = ["<1B", "3B", "7B", "14B", "32B", ">70B"];
-const PARAM_LAST_INDEX = PARAM_SLIDER_LABELS.length - 1;
-
-/** 模型量化比特位：优先 Rust 解析字段，其次从推荐量化文件名提取 */
-function modelQuantBits(model: HfModel): number | null {
-  if (model.quantBits != null && model.quantBits > 0) return model.quantBits;
-  if (model.sampleQuant) {
-    const match = model.sampleQuant.toUpperCase().match(/IQ?(\d)/);
-    if (match) return Number(match[1]);
-  }
-  return null;
-}
-
-/** 模型参数量展示文案（如 0.5B / 7B / 14B / 70B） */
-function paramLabel(model: HfModel): string {
-  const value = model.parametersB;
-  if (!value || value <= 0) return "";
-  if (value >= 100) return Math.round(value) + "B";
-  if (Number.isInteger(value) || value >= 10) return Math.round(value) + "B";
-  return value.toFixed(1).replace(/\.0$/, "") + "B";
-}
-
-/** 模型量化展示文案（如 Q4 / IQ3 / Q8），优先短标签 */
-function quantLabel(model: HfModel): string {
-  if (model.quantBits != null && model.quantBits > 0) return "Q" + model.quantBits;
-  if (model.sampleQuant) {
-    const match = model.sampleQuant.toUpperCase().match(/IQ?\d+/);
-    if (match) return match[0];
-  }
-  return "";
-}
-
-/** 从模型标签 / 推荐量化中收集仓库包含的量化规格（如 ["Q2","Q4","Q8"]） */
-function quantSpecsOf(model: HfModel): string[] {
-  const seen = new Set<string>();
-  const add = (text: string) => {
-    for (const tok of text.toUpperCase().match(/IQ?\d+/g) ?? []) {
-      const digits = tok.match(/(\d+)/)?.[1];
-      if (digits) seen.add("Q" + digits);
-    }
-  };
-  add(model.sampleQuant ?? "");
-  for (const tag of model.tags) add(tag);
-  return [...seen].slice(0, 3);
-}
-
-/** 从 GGUF 文件名提取量化比特位（Q4_K_M → 4、IQ3_M → 3、FP16/BF16 → 16） */
-function quantBitsOfFile(name: string): number | null {
-  const upper = name.toUpperCase();
-  if (/F(?:P)?16|BF16|FP32|F32/.test(upper)) return 16;
-  const match = upper.match(/IQ?(\d)/);
-  return match ? Number(match[1]) : null;
-}
-
-const SORT_KEYS = ["downloads", "likes", "updated", "hot"] as const;
-const HF_SORT: Record<SortKey, string> = {
-  downloads: "downloads",
-  likes: "likes",
-  updated: "lastModified",
-  hot: "trendingScore",
-};
-type SortKey = (typeof SORT_KEYS)[number];
-
-/** 从文件名提取量化标签（如 Q4_K_M / IQ3_M / Q8_0） */
-function quantBadge(name: string): string {
-  const match = name.match(/[IQ]?\d(?:_[A-Z0-9]+)+/i);
-  return match ? match[0].toUpperCase() : "";
-}
-
-/** 根据文件大小给出行内显存/运行建议标签 */
-function vramTag(file: HfFile, t: (key: import("../i18n").MessageKey, vars?: Record<string, string | number>) => string): string | null {
-  const gb = file.sizeBytes / 1024 / 1024 / 1024;
-  if (!file.sizeBytes) return null;
-  if (gb >= 24) return t("explore.vramShare");
-  if (gb >= 8) return t("explore.vramFit", { vram: "16G" });
-  return t("explore.vramLight");
-}
-
-interface FileRowProps {
-  file: HfFile;
-  progress?: ModelDownloadProgress;
-  disabled: boolean;
-  queued: boolean;
-  preferred?: boolean;
-  onDownload: (file: HfFile) => void;
-  onCancel?: (file: HfFile) => void;
-}
-
-function FileRow({ file, progress, disabled, queued, preferred, onDownload, onCancel }: FileRowProps) {
-  const { t } = useI18n();
-  const active = progress !== undefined && progress.phase !== "paused" && progress.phase !== "cancelled" && progress.phase !== "error";
-  const quant = quantBadge(file.name);
-  const speed = active ? humanSpeed(progress.speedBps) : "";
-
-  const isNinfer = file.name.toLowerCase().endsWith(".ninfer");
-
-  return (
-    <div className={cn("hf-file-row", preferred && "hf-file-row-preferred", active && "downloading")}>
-      <div className="hf-file-main">
-        {preferred && <Star size={12} className="hf-file-star" fill="currentColor" />}
-        <span
-          className={cn("hf-file-format-badge", isNinfer ? "ninfer" : "gguf")}
-          title={isNinfer ? t("models.formatNinferTitle") : t("models.formatGgufTitle")}
-        >
-          {isNinfer ? "NINFER" : "GGUF"}
-        </span>
-        {quant && <span className={cn("hf-quant-badge", preferred && "preferred")}>{quant}</span>}
-        <span className="hf-file-quant" title={file.name}>{fileName(file.name)}</span>
-      </div>
-      <div className="hf-file-side">
-        <span className="hf-file-size">{formatBytes(file.sizeBytes)}</span>
-        {speed ? <span className="hf-file-speed">{speed}</span> : null}
-        {(() => { const tag = vramTag(file, t); return tag ? <span className="hf-vram-tag">{tag}</span> : null; })()}
-        {active ? (
-          <button
-            type="button"
-            className="hf-download-btn downloading"
-            title={t("explore.cancel")}
-            onClick={() => onCancel?.(file)}
-          >
-            <span
-              className="btn-progress-fill"
-              style={{ width: `${Math.min(100, Math.max(0, progress.percent))}%` }}
-            />
-            <span className="btn-content-downloading">
-              <Loader2 size={12} className="spin" />
-              <em>{progress.percent}%</em>
-            </span>
-            <span className="btn-content-cancel">
-              <X size={13} />
-              <span>{t("explore.cancel")}</span>
-            </span>
-          </button>
-        ) : queued ? (
-          <button
-            type="button"
-            className="hf-download-btn queued"
-            title={t("explore.cancel")}
-            onClick={() => onCancel?.(file)}
-          >
-            <span className="btn-content-queued">
-              <Check size={12} />
-              <span>{t("explore.inQueue")}</span>
-            </span>
-            <span className="btn-content-cancel">
-              <X size={13} />
-              <span>{t("explore.cancel")}</span>
-            </span>
-          </button>
-        ) : (
-          <button className="hf-download-btn" disabled={disabled} onClick={() => onDownload(file)}>
-            ⤓ {t("explore.downloadShort")}
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
-
-/* ---------------- HF 作者头像（组织 / 用户 logo） ---------------- */
-
-/** 已解析的作者头像：author -> data URI；null 表示无头像，渲染时回退 "HF" 文字徽章 */
-const avatarCache = new Map<string, string | null>();
-/** 同一作者的并发请求去重：避免列表里同组织多行时重复拉取 */
-const avatarPending = new Map<string, Promise<string | null>>();
-
-function loadAvatar(author: string): Promise<string | null> {
-  if (avatarCache.has(author)) return Promise.resolve(avatarCache.get(author)!);
-  let pending = avatarPending.get(author);
-  if (!pending) {
-    pending = hfAvatar(author)
-      .then((uri) => {
-        avatarCache.set(author, uri);
-        return uri;
-      })
-      .catch(() => {
-        avatarCache.set(author, null);
-        return null;
-      })
-      .finally(() => avatarPending.delete(author));
-    avatarPending.set(author, pending);
-  }
-  return pending;
-}
-
-/** 模型行 / 趋势卡左侧图标：优先展示作者头像，拉取失败或无头像时回退 "HF" 徽章 */
-function ModelAvatar({ author }: { author: string }) {
-  const [uri, setUri] = useState<string | null>(avatarCache.get(author) ?? null);
-  useEffect(() => {
-    let alive = true;
-    loadAvatar(author).then((resolved) => {
-      if (alive) setUri(resolved);
-    });
-    return () => {
-      alive = false;
-    };
-  }, [author]);
-  return uri
-    ? <img className="hf-model-icon hf-model-avatar" src={uri} alt="" loading="lazy" draggable={false} />
-    : <span className="hf-model-icon">HF</span>;
-}
-
-interface ModelRowProps {
-  model: HfModel;
-  preferredQuant: boolean;
-  rank?: number;
-  onViewFiles: (model: HfModel) => void;
-}
-
-/** memo：进度轮询/悬浮等引起的父级重渲染不再逐行重算 paramLabel/quantSpecsOf */
-const ModelRow = memo(function ModelRow({ model, preferredQuant, rank, onViewFiles }: ModelRowProps) {
-  const { t } = useI18n();
-  const parameter = paramLabel(model);
-  const quant = quantLabel(model);
-  const quantSpecs = quantSpecsOf(model);
-  const updated = model.updatedAt ? model.updatedAt.slice(0, 10) : "";
-  const fileCount = model.ggufCount >= 0 ? model.ggufCount : null;
-  const isNinfer = Boolean(
-    model.id.toLowerCase().includes("ninfer") ||
-    model.name?.toLowerCase().includes("ninfer") ||
-    model.tags?.some((tag) => tag.toLowerCase().includes("ninfer"))
-  );
-  const isGguf = Boolean(
-    model.id.toLowerCase().includes("gguf") ||
-    model.name?.toLowerCase().includes("gguf") ||
-    model.tags?.some((tag) => tag.toLowerCase().includes("gguf")) ||
-    (!isNinfer)
-  );
-  const formatLabel = isNinfer && isGguf ? "GGUF · NINFER" : isNinfer ? "NINFER" : "GGUF";
-
-  const metaBits = [
-    updated ? t("explore.metaUpdated", { date: updated }) : "",
-    fileCount != null ? t("explore.metaFiles", { count: fileCount }) : "",
-    formatLabel,
-  ].filter(Boolean);
-  if (quantSpecs.length > 1) metaBits.push(t("explore.quantSpecs", { quants: quantSpecs.join("/") }));
-  return (
-    <div className={cn("hf-model-row", preferredQuant && "hf-model-row-preferred", rank != null && `hf-model-ranked rank-${rank}`)}>
-      <div className="hf-model-row-body">
-        {rank != null && (
-          <div className={cn("model-rank-badge", rank === 1 ? "top-1" : rank === 2 ? "top-2" : rank === 3 ? "top-3" : "top-n")} title={`TOP ${rank}`}>
-            {rank <= 3 && <Flame size={12} className="rank-flame" />}
-            <span>{rank <= 3 ? `TOP ${rank}` : rank < 10 ? `#0${rank}` : `#${rank}`}</span>
-          </div>
-        )}
-        <div className="hf-model-main-col">
-          <div className="hf-model-title-row">
-            <ModelAvatar author={model.author} />
-            <strong title={model.id}>{model.id}</strong>
-            {isGguf && <span className="hf-format-pill gguf" title={t("models.formatGgufTitle")}>GGUF</span>}
-            {isNinfer && <span className="hf-format-pill ninfer" title={t("models.formatNinferTitle")}>NINFER</span>}
-            {preferredQuant && <span className="hf-quant-badge preferred" title={t("explore.quantPreferred", { quant: quant || "" })}><Star size={10} fill="currentColor" />{quant}</span>}
-            {parameter && <span className="hf-param-badge" title={t("explore.facetParams")}>{parameter}</span>}
-            {quant && !preferredQuant && <span className="hf-quant-badge" title={t("explore.facetQuant")}>{quant}</span>}
-            <button className="hf-model-link" type="button" title={t("explore.openOnHf")} aria-label={t("explore.openOnHf")} onClick={(event) => { event.stopPropagation(); openHf(model.id); }}>
-              <ExternalLink size={14} />
-            </button>
-          </div>
-          <span className="hf-model-desc">{metaBits.join(" · ")}</span>
-        </div>
-        <div className="hf-model-side-col">
-          <div className="hf-model-meta">
-            <span className="likes" title={model.likes.toLocaleString()}><Star size={12} fill="currentColor" />{formatCount(model.likes)}</span>
-            <span title={model.downloads.toLocaleString()}><Download size={12} />{formatCount(model.downloads)}</span>
-          </div>
-          <div className="hf-model-actions">
-            <button className="secondary-button compact" onClick={() => onViewFiles(model)}><Download size={13} />{t("explore.viewFilesShort")}</button>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-});
-
-interface FileModalProps {
-  model: HfModel;
-  files: HfFile[] | null;
-  filesLoading: boolean;
-  filesError: string | null;
-  preferredBits: number[] | null;
-  diskUsage: DiskUsage | null;
-  progressMap: Record<string, ModelDownloadProgress>;
-  queuedKeys: Set<string>;
-  onDownloadFile: (file: HfFile) => void;
-  onCancelDownloadFile?: (file: HfFile) => void;
-  onPickModelsDir: () => Promise<void>;
-  onClose: () => void;
-}
-
-/** 通用文件下载弹窗：热门卡 / 模型列表共用，页面不滚动、卡片不内嵌展开 */
-function FileModal({ model, files, filesLoading, filesError, preferredBits, diskUsage, progressMap, queuedKeys, onDownloadFile, onCancelDownloadFile, onPickModelsDir, onClose }: FileModalProps) {
-  const { t } = useI18n();
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-  /** 偏好量化置顶：匹配行排最前并高亮，其余按文件名保持稳定 */
-  const isPreferredFile = (name: string) => preferredBits != null && preferredBits.length > 0 && preferredBits.includes(quantBitsOfFile(name) ?? -1);
-  const ordered = useMemo(() => {
-    if (!preferredBits || preferredBits.length === 0 || !files) return files;
-    const copy = [...files];
-    copy.sort((a, b) => {
-      const am = isPreferredFile(a.name) ? 0 : 1;
-      const bm = isPreferredFile(b.name) ? 0 : 1;
-      return am - bm || a.name.localeCompare(b.name);
-    });
-    return copy;
-  }, [files, preferredBits]);
-  return (
-    <div className="file-modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section className="file-modal">
-        <header>
-          <div className="file-modal-head">
-            <strong>{model.id}</strong>
-            <span>⭐ {model.likes.toLocaleString()} · ⬇ {model.downloads.toLocaleString()} · {t("explore.fileCount", { count: files !== null ? files.length : (model.ggufCount >= 0 ? model.ggufCount : "—") })}</span>
-          </div>
-          <button className="ghost-icon" title={t("ariaClose")} onClick={onClose}><X size={18} /></button>
-        </header>
-        <div className="file-modal-path">
-          <span><FolderOpen size={14} />{diskUsage?.path ?? t("explore.storageDir")}{diskUsage ? " · " + t("explore.storageFree", { free: formatBytes(diskUsage.freeBytes) }) : ""}</span>
-          <button className="secondary-button compact" onClick={() => void onPickModelsDir()}><FolderOpen size={13} />{t("explore.changeDir")}</button>
-        </div>
-        <div className="file-modal-body">
-          {filesLoading && <span className="hf-files-hint"><Loader2 size={13} className="spin" />{t("explore.loading")}</span>}
-          {filesError && <span className="hf-files-hint err">{filesError}</span>}
-          {!filesLoading && !filesError && ordered !== null && (
-            ordered.length === 0
-              ? <span className="hf-files-hint">{t("explore.emptyFiles")}</span>
-              : (
-                <div className="hf-files-list">
-                  {ordered.map((file) => (
-                    <FileRow key={file.name} file={file} disabled={false} preferred={isPreferredFile(file.name)} queued={queuedKeys.has(model.id + "::" + file.name)} progress={progressMap[model.id + "::" + file.name]} onDownload={onDownloadFile} onCancel={onCancelDownloadFile} />
-                  ))}
-                </div>
-              )
-          )}
-        </div>
-        <footer>
-          <button className="secondary-button compact" onClick={onClose}>{t("ariaClose")}</button>
-        </footer>
-      </section>
-    </div>
-  );
-}
-
-/* ---------------- 左侧刻面筛选侧边栏 ---------------- */
-
-interface FacetSidebarProps {
-  mobileOpen: boolean;
-  collapsed: boolean;
-  family: FamilyKey;
-  quantBits: number[];
-  tasks: TaskKey[];
-  paramMin: number;
-  paramMax: number;
-  onSelectFamily: (key: FamilyKey) => void;
-  onToggleQuant: (bits: number) => void;
-  onSelectAllQuant: () => void;
-  onToggleTask: (key: TaskKey) => void;
-  onParamMin: (value: number) => void;
-  onParamMax: (value: number) => void;
-  onResetParams: () => void;
-  onResetAll: () => void;
-  onToggleCollapsed: () => void;
-}
-
-function FacetSidebar({ mobileOpen, collapsed, family, quantBits, tasks, paramMin, paramMax, onSelectFamily, onToggleQuant, onSelectAllQuant, onToggleTask, onParamMin, onParamMax, onResetParams, onResetAll, onToggleCollapsed }: FacetSidebarProps) {
-  const { t } = useI18n();
-  const lockRange = `${PARAM_SLIDER_LABELS[paramMin]} ~ ${PARAM_SLIDER_LABELS[paramMax]}`;
-  const pctLeft = (paramMin / PARAM_LAST_INDEX) * 100;
-  const pctWidth = ((paramMax - paramMin) / PARAM_LAST_INDEX) * 100;
-
-  return (
-    <aside className={cn("facet-sidebar", mobileOpen && "facet-mobile-open", collapsed && "facet-sidebar-collapsed")}>
-      <div className="facet-sidebar-head">
-        <strong className="facet-sidebar-title"><SlidersHorizontal size={14} />{t("explore.facetSidebar")}</strong>
-        <div className="facet-sidebar-actions">
-          <button className="facet-collapse-btn" onClick={onToggleCollapsed} title={collapsed ? t("explore.facetExpand") : t("explore.facetCollapse")} aria-label={collapsed ? t("explore.facetExpand") : t("explore.facetCollapse")}>
-            <ChevronLeft size={16} className={cn("facet-collapse-icon", collapsed && "rotated")} />
-          </button>
-          <button className="facet-reset-all" onClick={onResetAll}>{t("explore.facetReset")}</button>
-        </div>
-      </div>
-
-      <section className="facet-section">
-        <div className="facet-section-title">
-          <strong>{t("explore.facetFamily")}</strong>
-        </div>
-        <div className="facet-chips">
-          {FAMILIES.map((item) => (
-            <button key={item.key} className={cn("facet-chip", family === item.key && "active")} onClick={() => onSelectFamily(item.key)}>
-              {item.label.startsWith("explore.") ? t(item.label as import("../i18n").MessageKey) : item.label}
-            </button>
-          ))}
-        </div>
-      </section>
-
-      <section className="facet-section">
-        <div className="facet-section-title">
-          <strong>{t("explore.facetParams")}</strong>
-          <button className="facet-reset" onClick={onResetParams}>{t("explore.facetReset")}</button>
-        </div>
-        <div className="facet-range-wrap">
-          <div className="facet-range-stack">
-            <div className="facet-range-track"><span style={{ left: pctLeft + "%", width: Math.max(pctWidth, 0) + "%" }} /></div>
-            <span className="facet-range-thumb-label" style={{ left: `calc(6px + ${pctLeft}% - ${pctLeft * 0.12}px)` }}>{PARAM_SLIDER_LABELS[paramMin]}</span>
-            <span className="facet-range-thumb-label" style={{ left: `calc(6px + ${(pctLeft + pctWidth)}% - ${(pctLeft + pctWidth) * 0.12}px)` }}>{PARAM_SLIDER_LABELS[paramMax]}</span>
-            <input type="range" className="facet-range facet-range-min" min={0} max={PARAM_LAST_INDEX} step={1} value={paramMin} onChange={(event) => onParamMin(Number(event.target.value))} />
-            <input type="range" className="facet-range facet-range-max" min={0} max={PARAM_LAST_INDEX} step={1} value={paramMax} onChange={(event) => onParamMax(Number(event.target.value))} />
-          </div>
-          <div className="facet-range-scale">
-            {PARAM_SLIDER_LABELS.map((label) => <span key={label}>{label}</span>)}
-          </div>
-          {(paramMin > 0 || paramMax < PARAM_LAST_INDEX) && (
-            <div className="facet-lock-line">{t("explore.facetParamsLocked", { range: lockRange })}</div>
-          )}
-        </div>
-      </section>
-
-      <section className="facet-section">
-        <div className="facet-section-title">
-          <strong>{t("explore.facetQuant")}</strong>
-        </div>
-        <div className="facet-chips facet-chips-quant">
-          <button className={cn("facet-chip", quantBits.length === 0 && "active")} onClick={onSelectAllQuant}>{t("explore.quantAll")}</button>
-          {QUANTS.map((item) => (
-            <button key={item.key} className={cn("facet-chip", item.cls, quantBits.includes(item.bits[0]) && "active")} onClick={() => onToggleQuant(item.bits[0])} title={t(item.label as import("../i18n").MessageKey)}>
-              {t(item.label as import("../i18n").MessageKey)}
-            </button>
-          ))}
-        </div>
-      </section>
-
-      <section className="facet-section">
-        <div className="facet-section-title">
-          <strong>{t("explore.facetTasks")}</strong>
-        </div>
-        <div className="facet-chips facet-chips-tasks">
-          {TASKS.map((item) => (
-            <button key={item.key} className={cn("facet-chip", tasks.includes(item.key) && "active")} onClick={() => onToggleTask(item.key)}>
-              {t(item.label as import("../i18n").MessageKey)}
-            </button>
-          ))}
-        </div>
-      </section>
-    </aside>
-  );
-}
 export default function ExplorePage(props: Props) {
   const { t } = useI18n();
   const showToast = props.onToast;
   const [view, setView] = useState<"discover" | "tasks">("discover");
+  const [communitySource, setCommunitySource] = useState<CommunitySource>(() => {
+    try {
+      const saved = localStorage.getItem("cookllm_community_source");
+      if (saved === "ms" || saved === "hf") return saved;
+    } catch {}
+    return "hf";
+  });
+  const [sourceMenuOpen, setSourceMenuOpen] = useState(false);
+  const sourceMenuRef = useRef<HTMLDivElement>(null);
   const [query, setQuery] = useState("");
   const [formatFilter, setFormatFilter] = useState<FormatFilter>(() => {
     try {
@@ -632,8 +134,6 @@ export default function ExplorePage(props: Props) {
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => props.config.exploreSidebarCollapsed ?? false);
   const [isNarrow, setIsNarrow] = useState(() => typeof window !== "undefined" && window.matchMedia("(max-width:1180px)").matches);
   const searchSeq = useRef(0);
-  /** 趋势榜单是否已首次加载（切入本页时才请求，只加载一次） */
-  const trendingLoadedRef = useRef(false);
   const searchRef = useRef<HTMLInputElement>(null);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
 
@@ -662,6 +162,34 @@ export default function ExplorePage(props: Props) {
     return [...new Set(parts)].join(" ");
   }, [query, family, tasks, quantBits, paramMin, paramMax]);
 
+  // 点击外部关闭源切换下拉
+  useEffect(() => {
+    if (!sourceMenuOpen) return;
+    const onMouseDown = (e: MouseEvent) => {
+      if (sourceMenuRef.current && !sourceMenuRef.current.contains(e.target as Node)) {
+        setSourceMenuOpen(false);
+      }
+    };
+    window.addEventListener("mousedown", onMouseDown);
+    return () => window.removeEventListener("mousedown", onMouseDown);
+  }, [sourceMenuOpen]);
+
+  const handleCommunitySourceChange = (src: CommunitySource) => {
+    if (src === communitySource) {
+      setSourceMenuOpen(false);
+      return;
+    }
+    setCommunitySource(src);
+    try {
+      localStorage.setItem("cookllm_community_source", src);
+    } catch {}
+    setSourceMenuOpen(false);
+    setModels([]);
+    setTrending([]);
+    setFilesMap({});
+    searchKeyRef.current = null;
+  };
+
   // Ctrl+K 聚焦搜索（仅本页可见时监听，避免与模型页搜索框的快捷键重复抢占焦点）
   useEffect(() => {
     if (!props.visible) return;
@@ -676,13 +204,12 @@ export default function ExplorePage(props: Props) {
     return () => window.removeEventListener("keydown", onKey);
   }, [props.visible]);
 
-  // 初始化：加载趋势榜单 + 探测本机硬件（首次切入本页时才请求，避免启动即发起网络请求）
+  // 初始化及切换社区源：加载趋势榜单
   useEffect(() => {
-    if (props.visible && !trendingLoadedRef.current) {
-      trendingLoadedRef.current = true;
+    if (props.visible) {
       void refreshTrending();
     }
-  }, [props.visible]);
+  }, [props.visible, communitySource]);
 
   // Narrow screens (<=1180px) switch the facet sidebar into a drawer
   useEffect(() => {
@@ -696,7 +223,10 @@ export default function ExplorePage(props: Props) {
     setTrendingLoading(true);
     const activeFilter = overrideFilter ?? formatFilter;
     try {
-      const result = await hfTrending(10, activeFilter === "gguf", undefined, undefined, undefined, activeFilter);
+      const isMs = communitySource === "ms";
+      const result = isMs
+        ? await msTrending(10, activeFilter === "gguf", undefined, undefined, undefined, activeFilter)
+        : await hfTrending(10, activeFilter === "gguf", undefined, undefined, undefined, activeFilter);
       setTrending(result);
       return true;
     } catch (err) {
@@ -713,11 +243,17 @@ export default function ExplorePage(props: Props) {
     let ok = false;
     let failMessage = "";
     try {
+      const isMs = communitySource === "ms";
       const useGguf = formatFilter === "gguf" && !keyword.toLowerCase().includes(".gguf");
       const quants = quantBits.length > 0 ? quantBits : undefined;
+      const sortParam = isMs ? MS_SORT[sortKey] : HF_SORT[sortKey];
       const result = keyword
-        ? await hfSearch(keyword, 30, useGguf, undefined, HF_SORT[sortKey], quants, formatFilter)
-        : await hfTrending(30, useGguf, undefined, HF_SORT[sortKey], quants, formatFilter);
+        ? (isMs
+            ? await msSearch(keyword, 30, useGguf, undefined, sortParam, quants, formatFilter)
+            : await hfSearch(keyword, 30, useGguf, undefined, sortParam, quants, formatFilter))
+        : (isMs
+            ? await msTrending(30, useGguf, undefined, sortParam, quants, formatFilter)
+            : await hfTrending(30, useGguf, undefined, sortParam, quants, formatFilter));
       if (seq !== searchSeq.current) return false; // 已发起更新的请求，丢弃过期结果
       setModels(result);
       setHasMore(result.length === 30);
@@ -745,11 +281,11 @@ export default function ExplorePage(props: Props) {
     if (notify) showToast(listOk && trendingOk ? t("explore.refreshed") : t("explore.refreshFailed"));
   };
 
-  // 搜索防抖 300ms：文本 / 刻面 / 量化偏好 / 参数档位 / 格式筛选变化时向服务端重查并重置列表；
+  // 搜索防抖 300ms：文本 / 刻面 / 量化偏好 / 参数档位 / 格式筛选 / 社区源变化时向服务端重查并重置列表；
   // 仅本页可见时发起（含首次切入），避免应用启动即产生网络请求。
   // 切页返回时若搜索条件未变且已有数据 → 直接复用已加载列表，不再白屏转圈重查。
   const searchKeyRef = useRef<string | null>(null);
-  const searchSignature = `${effectiveKeyword}|${formatFilter}|${sortKey}|${quantBits.join(",")}`;
+  const searchSignature = `${communitySource}|${effectiveKeyword}|${formatFilter}|${sortKey}|${quantBits.join(",")}`;
   useEffect(() => {
     if (!props.visible) return;
     if (searchKeyRef.current === searchSignature && models.length > 0) return;
@@ -769,11 +305,17 @@ export default function ExplorePage(props: Props) {
     const skip = models.length;
     setLoadingMore(true);
     try {
+      const isMs = communitySource === "ms";
       const useGguf = formatFilter === "gguf" && !keyword.toLowerCase().includes(".gguf");
       const quants = quantBits.length > 0 ? quantBits : undefined;
+      const sortParam = isMs ? MS_SORT[sortKey] : HF_SORT[sortKey];
       const next = keyword
-        ? await hfSearch(keyword, limit, useGguf, skip, HF_SORT[sortKey], quants, formatFilter)
-        : await hfTrending(limit, useGguf, skip, HF_SORT[sortKey], quants, formatFilter);
+        ? (isMs
+            ? await msSearch(keyword, limit, useGguf, skip, sortParam, quants, formatFilter)
+            : await hfSearch(keyword, limit, useGguf, skip, sortParam, quants, formatFilter))
+        : (isMs
+            ? await msTrending(limit, useGguf, skip, sortParam, quants, formatFilter)
+            : await hfTrending(limit, useGguf, skip, sortParam, quants, formatFilter));
       const seen = new Set(models.map((item) => item.id));
       const added = next.filter((item) => !seen.has(item.id));
       if (seq !== searchSeq.current) {
@@ -818,15 +360,18 @@ export default function ExplorePage(props: Props) {
   const openFilesRef = useRef((_model: HfModel) => {});
   openFilesRef.current = (model: HfModel) => {
     setModalModel(model);
-    if (filesMap[model.id] === undefined && !filesLoading[model.id]) {
-      setFilesLoading((previous) => ({ ...previous, [model.id]: true }));
-      setFilesError((previous) => ({ ...previous, [model.id]: null }));
-      void hfListFiles(model.id).then((result) => {
-        setFilesMap((previous) => ({ ...previous, [model.id]: result }));
+    const isMs = model.source === "ms";
+    const cacheKey = `${model.id}::${formatFilter}`;
+    if (filesMap[cacheKey] === undefined && !filesLoading[cacheKey]) {
+      setFilesLoading((previous) => ({ ...previous, [cacheKey]: true }));
+      setFilesError((previous) => ({ ...previous, [cacheKey]: null }));
+      const fetchPromise = isMs ? msListFiles(model.id, formatFilter) : hfListFiles(model.id, formatFilter);
+      void fetchPromise.then((result) => {
+        setFilesMap((previous) => ({ ...previous, [cacheKey]: result }));
       }).catch((err) => {
-        setFilesError((previous) => ({ ...previous, [model.id]: err instanceof Error ? err.message : String(err) }));
+        setFilesError((previous) => ({ ...previous, [cacheKey]: err instanceof Error ? err.message : String(err) }));
       }).finally(() => {
-        setFilesLoading((previous) => ({ ...previous, [model.id]: false }));
+        setFilesLoading((previous) => ({ ...previous, [cacheKey]: false }));
       });
     }
   };
@@ -841,7 +386,8 @@ export default function ExplorePage(props: Props) {
 
   const downloadFile = (model: HfModel, file: HfFile) => {
     if (!diskGuard(file.sizeBytes)) return;
-    props.onDownload(model.id, file.name, file.sizeBytes);
+    const isMs = model.source === "ms";
+    props.onDownload(model.id, file.name, file.sizeBytes, isMs ? "ms" : "hf");
     const key = model.id + "::" + file.name;
     setQueued((previous) => new Set(previous).add(key));
     window.setTimeout(() => {
@@ -1095,8 +641,49 @@ export default function ExplorePage(props: Props) {
                 <ChevronRight size={14} />{t("explore.facetToggle")}{facetCount > 0 && <em>{facetCount}</em>}
               </button>
             )}
-            <label className="search-box explore-search" title="Ctrl+K 快速聚焦">
-              <span className="explore-source"><span>🤗</span> HuggingFace<ChevronDown size={12} /></span>
+            <div className="search-box explore-search" title="Ctrl+K 快速聚焦">
+              <div className="explore-source-wrapper" ref={sourceMenuRef}>
+                <button
+                  type="button"
+                  className={cn("explore-source-btn", communitySource === "ms" && "source-ms")}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setSourceMenuOpen((v) => !v);
+                  }}
+                  title={communitySource === "ms" ? "ModelScope" : t("explore.sourceHf")}
+                >
+                  <span className="explore-source-icon">
+                    {communitySource === "ms" ? <ModelScopeLogo size={15} /> : "🤗"}
+                  </span>
+                  <span className="explore-source-name">{communitySource === "ms" ? "ModelScope" : t("explore.sourceHf")}</span>
+                  <ChevronDown size={12} className={cn("explore-source-arrow", sourceMenuOpen && "open")} />
+                </button>
+                {sourceMenuOpen && (
+                  <div className="explore-source-dropdown" onClick={(e) => e.stopPropagation()}>
+                    <button
+                      type="button"
+                      className={cn("explore-source-item", communitySource === "hf" && "active")}
+                      onClick={() => handleCommunitySourceChange("hf")}
+                    >
+                      <span className="source-item-icon">🤗</span>
+                      <span className="source-item-label">{t("explore.sourceHf")}</span>
+                      {communitySource === "hf" && <Check size={14} className="source-item-check" />}
+                    </button>
+                    <button
+                      type="button"
+                      className={cn("explore-source-item", communitySource === "ms" && "active")}
+                      onClick={() => handleCommunitySourceChange("ms")}
+                    >
+                      <span className="source-item-icon">
+                        <ModelScopeLogo size={16} />
+                      </span>
+                      <span className="source-item-label">{t("explore.sourceMs")}</span>
+                      {communitySource === "ms" && <Check size={14} className="source-item-check" />}
+                    </button>
+                  </div>
+                )}
+              </div>
               <Search size={14} />
               <input
                 ref={searchRef}
@@ -1111,7 +698,7 @@ export default function ExplorePage(props: Props) {
                 placeholder={t("explore.searchPlaceholder")}
               />
               <kbd>Ctrl+K</kbd>
-            </label>
+            </div>
             <div className="explore-search-tools">
               <select className="explore-sort-select" value={sortKey} onChange={(e) => setSortKey(e.target.value as SortKey)}>
                 <option value="downloads">{t("explore.sortDownloads")}</option>
@@ -1238,7 +825,12 @@ export default function ExplorePage(props: Props) {
                   ))}
                 </div>
               ) : null}
-              {error && !loading && <div className="hf-empty err"><p>{error}</p><span className="hf-net-hint">{t("explore.netErrorHint")}</span></div>}
+              {error && !loading && (
+                <div className="hf-empty err">
+                  <p>{error}</p>
+                  <span className="hf-net-hint">{communitySource === "ms" ? t("explore.netErrorHintMs") : t("explore.netErrorHint")}</span>
+                </div>
+              )}
               {!loading && !error && sorted.length === 0 && <div className="hf-empty"><h3>{t("explore.noResults")}</h3><p>{t("explore.noResultsDesc")}</p></div>}
               {sorted.map((model) => (
                 <ModelRow
@@ -1372,210 +964,20 @@ export default function ExplorePage(props: Props) {
             <span>{t("explore.totalSpeed", { speed: humanSpeed(totalSpeed) })}</span>
           </div>
         )}
-        {(taskFilter === "all" || taskFilter === "active") && tasksActive.map((item) => {
-          const key = item.repo + "::" + item.file;
-          const progress = props.progressMap[key];
-          const percent = progress?.percent ?? item.percent ?? 0;
-          const downloaded = progress?.downloaded ?? item.downloaded ?? 0;
-          const total = progress?.total ?? item.total ?? item.sizeBytes ?? 0;
-          const speed = progress?.speedBps ?? item.speedBps ?? 0;
-          const etaSeconds = speed > 0 && total > downloaded ? Math.ceil((total - downloaded) / speed) : 0;
-          let eta = "--:--";
-          if (etaSeconds > 0) {
-            const hours = Math.floor(etaSeconds / 3600);
-            const mins = Math.floor((etaSeconds % 3600) / 60);
-            const secs = etaSeconds % 60;
-            eta = hours > 0
-              ? `${String(hours).padStart(2, "0")}:${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`
-              : `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
-          }
-          const percentFormatted = typeof percent === "number"
-            ? (percent % 1 === 0 ? String(percent) : percent.toFixed(1))
-            : "0";
-          return (
-            <div className="task-card task-card-active" key={item.taskId}>
-              {/* 底层融合淡色半透进度条 */}
-              <div
-                className="task-card-bg-progress"
-                style={{ width: `${Math.min(100, Math.max(0, percent))}%` }}
-              />
-
-              {/* 卡片主内容（处于上层，不受半透背景干扰） */}
-              <div className="task-card-active-content">
-                {/* 1. 左侧文件信息与多选 */}
-                <div className="task-active-left">
-                  {batchMode && (
-                    <label className="task-card-check" title={t("explore.selectTask")}>
-                      <input
-                        type="checkbox"
-                        checked={selectedIds.has(item.taskId)}
-                        onChange={() => toggleSelect(item.taskId)}
-                      />
-                    </label>
-                  )}
-                  <span className="task-file-icon dl">
-                    <Database size={16} />
-                  </span>
-                  <div className="task-file-info">
-                    <strong className="task-active-filename" title={item.file}>{item.file}</strong>
-                    <div className="task-active-meta">
-                      <span className="task-active-size">
-                        <FileText size={12} className="task-meta-icon" />
-                        <span>{formatBytes(downloaded)} / {formatBytes(total)}</span>
-                      </span>
-                    </div>
-                  </div>
-                </div>
-
-                {/* 竖线分割 */}
-                <div className="task-stat-divider" />
-
-                {/* 2. 当前速度列 */}
-                <div className="task-stat-col col-speed">
-                  <div className="task-stat-val task-stat-speed">
-                    <ArrowDown size={14} className="task-speed-arrow" />
-                    <span>{humanSpeed(speed) || "0 KB/s"}</span>
-                  </div>
-                </div>
-
-                {/* 竖线分割 */}
-                <div className="task-stat-divider" />
-
-                {/* 3. 百分比完成度列 */}
-                <div className="task-stat-col col-percent">
-                  <div className="task-stat-val task-stat-percent">
-                    <span>{percentFormatted}%</span>
-                  </div>
-                </div>
-
-                {/* 竖线分割 */}
-                <div className="task-stat-divider" />
-
-                {/* 4. 预计剩余时间列 */}
-                <div className="task-stat-col col-eta">
-                  <div className="task-stat-val task-stat-eta">
-                    <Clock size={13} className="task-eta-clock" />
-                    <span>{eta !== "--:--" ? t("explore.statEtaVal", { eta }) : "--:--"}</span>
-                  </div>
-                </div>
-
-                {/* 5. 右侧操作按钮组 */}
-                <div className="task-active-actions">
-                  <button
-                    type="button"
-                    className="task-circle-btn"
-                    title={t("explore.pause")}
-                    aria-label={t("explore.pause")}
-                    onClick={() => props.onPauseTask(item)}
-                  >
-                    <Pause size={15} />
-                  </button>
-                  {(item.repo !== "direct-url" || item.url) && (
-                    <button
-                      type="button"
-                      className="task-circle-btn"
-                      title={t("explore.openOnHf")}
-                      aria-label={t("explore.openOnHf")}
-                      onClick={() => {
-                        if (item.repo !== "direct-url") {
-                          openHf(item.repo);
-                        } else if (item.url) {
-                          void openExternal(item.url);
-                        }
-                      }}
-                    >
-                      <ExternalLink size={15} />
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    className="task-circle-btn danger"
-                    title={t("explore.cancelDelete")}
-                    aria-label={t("explore.cancelDelete")}
-                    onClick={() => {
-                      setTaskToDelete(item);
-                      setDeleteLocalFile(false);
-                    }}
-                  >
-                    <Trash2 size={15} />
-                  </button>
-                </div>
-              </div>
-            </div>
-          );
-        })}
-
-        {/* 已完成任务分段 */}
-        {(taskFilter === "all" || taskFilter === "done") && tasksDone.length > 0 && (
-          <div className="tasks-section-title">
-            <h2>{t("explore.tasksDone")} ({tasksDone.length})</h2>
-          </div>
-        )}
-        {taskFilter === "done" && tasksDone.length === 0 && (
-          <div className="tasks-empty"><span>{t("explore.noDoneTasks")}</span></div>
-        )}
-        {(taskFilter === "all" || taskFilter === "done") && tasksDone.map((item) => (
-          <div className="task-card task-card-done" key={item.taskId}>
-            <div className="task-card-head">
-              {batchMode && (
-                <label className="task-card-check" title={t("explore.selectTask")}>
-                  <input
-                    type="checkbox"
-                    checked={selectedIds.has(item.taskId)}
-                    onChange={() => toggleSelect(item.taskId)}
-                  />
-                </label>
-              )}
-              <span className="task-file-icon ok"><Check size={16} /></span>
-              <div className="task-file-info">
-                <strong>{item.file}</strong>
-                <span>{t("explore.syncedToLibrary")}</span>
-              </div>
-              <div className="task-card-actions task-active-actions">
-                {item.finishedAt ? <span className="task-done-time">{new Date(item.finishedAt).toLocaleString()}</span> : null}
-                {item.path && (
-                  <button
-                    type="button"
-                    className="task-circle-btn"
-                    title={t("explore.openFolder")}
-                    aria-label={t("explore.openFolder")}
-                    onClick={() => void props.onReveal(item.path!)}
-                  >
-                    <FolderOpen size={15} />
-                  </button>
-                )}
-                {(item.repo !== "direct-url" || item.url) && (
-                  <button
-                    type="button"
-                    className="task-circle-btn"
-                    title={t("explore.openOnHf")}
-                    aria-label={t("explore.openOnHf")}
-                    onClick={() => {
-                      if (item.repo !== "direct-url") {
-                        openHf(item.repo);
-                      } else if (item.url) {
-                        void openExternal(item.url);
-                      }
-                    }}
-                  >
-                    <ExternalLink size={15} />
-                  </button>
-                )}
-                <button
-                  type="button"
-                  className="task-circle-btn danger"
-                  title={t("explore.delete")}
-                  aria-label={t("explore.delete")}
-                  onClick={() => {
-                    setTaskToDelete(item);
-                    setDeleteLocalFile(false);
-                  }}
-                >
-                  <Trash2 size={15} />
-                </button>
-              </div>
-            </div>
-          </div>
+        {(taskFilter === "all" || taskFilter === "active") && tasksActive.map((item) => (
+          <TaskCardActive
+            key={item.taskId}
+            item={item}
+            progress={props.progressMap[item.repo + "::" + item.file]}
+            batchMode={batchMode}
+            selected={selectedIds.has(item.taskId)}
+            onToggleSelect={toggleSelect}
+            onPause={props.onPauseTask}
+            onDelete={(task) => {
+              setTaskToDelete(task);
+              setDeleteLocalFile(false);
+            }}
+          />
         ))}
 
         {/* 失败/暂停任务分段 */}
@@ -1588,81 +990,43 @@ export default function ExplorePage(props: Props) {
           <div className="tasks-empty"><span>{t("explore.noTasks")}</span></div>
         )}
         {(taskFilter === "all" || taskFilter === "failed") && tasksFailed.map((item) => (
-          <div className="task-card task-card-error" key={item.taskId}>
-            <div className="task-card-head">
-              {batchMode && (
-                <label className="task-card-check" title={t("explore.selectTask")}>
-                  <input
-                    type="checkbox"
-                    checked={selectedIds.has(item.taskId)}
-                    onChange={() => toggleSelect(item.taskId)}
-                  />
-                </label>
-              )}
-              <span className="task-file-icon err"><AlertCircle size={16} /></span>
-              <div className="task-file-info">
-                <strong>{item.file}</strong>
-                <span className="task-status-text">
-                  {item.errorKind === "needs-token" ? t("explore.statusUnauthorized")
-                    : item.errorKind === "no-permission" ? t("explore.statusNoPermission")
-                      : item.error || (item.status === "cancelled" ? t("explore.statusPaused") : t("explore.statusError"))}
-                </span>
-              </div>
-              <div className="task-card-actions task-active-actions">
-                {item.errorKind === "needs-token" && (
-                  <button
-                    type="button"
-                    className="task-circle-btn accent"
-                    title={t("st.hfGatedNeedToken")}
-                    aria-label={t("st.hfGatedNeedToken")}
-                    onClick={props.onGoSettings}
-                  >
-                    <KeyRound size={15} />
-                  </button>
-                )}
-                <button
-                  type="button"
-                  className="task-circle-btn"
-                  title={t("explore.resume")}
-                  aria-label={t("explore.resume")}
-                  onClick={() => props.onRetry(item)}
-                >
-                  <Play size={15} />
-                </button>
-                {(item.repo !== "direct-url" || item.url) && (
-                  <button
-                    type="button"
-                    className="task-circle-btn"
-                    title={item.errorKind === "no-permission" ? t("st.hfGatedNoPermission") : t("explore.openOnHf")}
-                    aria-label={item.errorKind === "no-permission" ? t("st.hfGatedNoPermission") : t("explore.openOnHf")}
-                    onClick={() => {
-                      if (item.errorKind === "no-permission" && item.repo) {
-                        void openExternal(hfLicenseUrl(item.repo));
-                      } else if (item.repo !== "direct-url") {
-                        openHf(item.repo);
-                      } else if (item.url) {
-                        void openExternal(item.url);
-                      }
-                    }}
-                  >
-                    <ExternalLink size={15} />
-                  </button>
-                )}
-                <button
-                  type="button"
-                  className="task-circle-btn danger"
-                  title={t("explore.delete")}
-                  aria-label={t("explore.delete")}
-                  onClick={() => {
-                    setTaskToDelete(item);
-                    setDeleteLocalFile(false);
-                  }}
-                >
-                  <Trash2 size={15} />
-                </button>
-              </div>
-            </div>
+          <TaskCardFailed
+            key={item.taskId}
+            item={item}
+            batchMode={batchMode}
+            selected={selectedIds.has(item.taskId)}
+            onToggleSelect={toggleSelect}
+            onRetry={props.onRetry}
+            onGoSettings={props.onGoSettings}
+            onDelete={(task) => {
+              setTaskToDelete(task);
+              setDeleteLocalFile(false);
+            }}
+          />
+        ))}
+
+        {/* 已完成任务分段 */}
+        {(taskFilter === "all" || taskFilter === "done") && tasksDone.length > 0 && (
+          <div className="tasks-section-title">
+            <h2>{t("explore.tasksDone")} ({tasksDone.length})</h2>
           </div>
+        )}
+        {taskFilter === "done" && tasksDone.length === 0 && (
+          <div className="tasks-empty"><span>{t("explore.noDoneTasks")}</span></div>
+        )}
+        {(taskFilter === "all" || taskFilter === "done") && tasksDone.map((item) => (
+          <TaskCardDone
+            key={item.taskId}
+            item={item}
+            batchMode={batchMode}
+            selected={selectedIds.has(item.taskId)}
+            onToggleSelect={toggleSelect}
+            onReveal={props.onReveal}
+            onDelete={(task) => {
+              setTaskToDelete(task);
+              setDeleteLocalFile(false);
+            }}
+          />
         ))}
 
         {/* 无任务空状态 */}
@@ -1766,9 +1130,9 @@ export default function ExplorePage(props: Props) {
   {modalModel && (
     <FileModal
       model={modalModel}
-      files={filesMap[modalModel.id] ?? null}
-      filesLoading={!!filesLoading[modalModel.id]}
-      filesError={filesError[modalModel.id] ?? null}
+      files={filesMap[`${modalModel.id}::${formatFilter}`] ?? null}
+      filesLoading={!!filesLoading[`${modalModel.id}::${formatFilter}`]}
+      filesError={filesError[`${modalModel.id}::${formatFilter}`] ?? null}
       preferredBits={quantPreferredBits}
       diskUsage={props.diskUsage}
       progressMap={props.progressMap}
@@ -1780,18 +1144,4 @@ export default function ExplorePage(props: Props) {
     />
   )}
   </div>;
-}
-
-function openHf(id: string) {
-  void openExternal("https://huggingface.co/" + id);
-}
-
-function formatCount(value: number) {
-  const compact = (divisor: number, suffix: string) => {
-    const scaled = Math.floor(value / divisor * 10) / 10;
-    return scaled % 1 === 0 ? `${scaled}${suffix}` : `${scaled.toFixed(1)}${suffix}`;
-  };
-  if (value >= 1_000_000) return compact(1_000_000, "M");
-  if (value >= 1_000) return compact(1_000, "k");
-  return value.toLocaleString();
 }

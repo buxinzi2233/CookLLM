@@ -1,9 +1,10 @@
-import type { AppConfig, LlamaLogPayload, ModelAsset, Profile } from "./types";
+import type { AppConfig, LlamaEngine, LlamaLogPayload, ModelAsset, Profile } from "./types";
 import { formatMessage, getLocale } from "./i18n";
 import { getPlatform, pathIdentity, type Platform } from "./platform";
+import { DEFAULT_SHORTCUTS } from "./utils";
 
 /** 当前应用版本（与 tauri.conf.json / package.json 保持一致）：浏览器模式回退值，检测更新的比较基线 */
-export const APP_VERSION = "0.3.2";
+export const APP_VERSION = "0.4.1";
 /** 项目信息：GitHub 仓库（owner/repo）与主页地址 */
 export const APP_REPO = "Crvesoft/CookLLM";
 export const PROJECT_URL = `https://github.com/${APP_REPO}`;
@@ -13,61 +14,291 @@ export const uid = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().
 /** 真实桌面初始化使用空配置；演示模型与 Windows 示例路径只用于浏览器预览。 */
 export const EMPTY_CONFIG: AppConfig = { serverPath: "", engines: [], models: [] };
 
-/** 合并导入的配置：同路径模型保留本机条目并补齐缺失预设；调用方传入本机不存在的路径集合。 */
-export function mergeImportedConfig(current: AppConfig, incoming: AppConfig, missingPaths: Set<string> = new Set(), platform: Platform = getPlatform()): { config: AppConfig; added: number; updated: number; skipped: number } {
-  const key = (path: string) => pathIdentity(path, platform);
-  const missingKeys = new Set([...missingPaths].map(key));
-  const missing = (path?: string) => !path || missingKeys.has(key(path));
-  const byPath = new Map(current.models.map((model) => [key(model.path), model]));
-  let added = 0;
-  let updated = 0;
-  let skipped = 0;
-  const models = [...current.models];
-  for (const raw of incoming.models || []) {
-    const path = raw.path;
-    if (missing(path)) { skipped += 1; continue; }
-    const existing = byPath.get(key(path));
-    if (!existing) {
+export interface MergeImportOptions {
+  /** 导入模式：merge (智能合并) | overwrite (完全覆盖) */
+  mode?: "merge" | "overwrite";
+  /** 当同路径/同ID模型在本地存在时，是否使用备份中的预设参数更新本地同名预设（默认 true） */
+  updateExistingProfiles?: boolean;
+  /** 是否合并全局应用设置（网络代理、首选引擎/模型、界面偏好等；默认 true） */
+  importAppSettings?: boolean;
+  /** 物理路径不存在的模型处理方式：keep (保留条目并可后续重设路径) | skip (跳过)；默认 keep */
+  missingPathStrategy?: "keep" | "skip";
+  /** 路径重映射：用于跨机或换盘迁移，将旧路径前缀替换为新路径前缀 */
+  pathRemap?: { from: string; to: string };
+}
+
+export interface MergeImportResult {
+  config: AppConfig;
+  addedModels: number;
+  updatedModels: number;
+  skippedModels: number;
+  addedEngines: number;
+  importedSettings: boolean;
+}
+
+/** 路径前缀重映射辅助：将 Windows 或通用文件路径从旧目录前缀映射到新目录 */
+export function applyPathRemap(path: string | undefined, remap?: { from: string; to: string }): string {
+  if (!path || !remap || !remap.from?.trim() || !remap.to?.trim()) return path || "";
+  const normalize = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "");
+  const normPath = path.replace(/\\/g, "/");
+  const normFrom = normalize(remap.from.trim());
+  const normTo = normalize(remap.to.trim());
+
+  if (pathIdentity(normPath) === pathIdentity(normFrom)) {
+    return path.includes("\\") ? normTo.replace(/\//g, "\\") : normTo;
+  }
+  if (pathIdentity(normPath).startsWith(pathIdentity(normFrom) + "/")) {
+    const rest = normPath.slice(normFrom.length + 1);
+    const joined = `${normTo}/${rest}`;
+    return path.includes("\\") ? joined.replace(/\//g, "\\") : joined;
+  }
+  return path;
+}
+
+/** 合并导入的配置：同路径模型保留本机条目并补齐缺失预设；支持跨机迁移保留、路径重映射与覆盖/合并模式。 */
+export function mergeImportedConfig(
+  current: AppConfig,
+  incoming: AppConfig,
+  missingPaths: Set<string> = new Set(),
+  options: MergeImportOptions = {}
+): MergeImportResult {
+  const mode = options.mode || "merge";
+  const updateExistingProfiles = options.updateExistingProfiles ?? true;
+  const importAppSettings = options.importAppSettings ?? true;
+  const missingPathStrategy = options.missingPathStrategy ?? "keep";
+  const remap = options.pathRemap;
+
+  const remapModel = (model: ModelAsset): ModelAsset => {
+    if (!remap) return model;
+    return {
+      ...model,
+      path: applyPathRemap(model.path, remap),
+      profiles: (model.profiles || []).map((p) => ({
+        ...p,
+        mmprojPath: p.mmprojPath ? applyPathRemap(p.mmprojPath, remap) : undefined,
+        mtpDraftPath: p.mtpDraftPath ? applyPathRemap(p.mtpDraftPath, remap) : undefined,
+        chatTemplatePath: p.chatTemplatePath ? applyPathRemap(p.chatTemplatePath, remap) : undefined,
+      })),
+    };
+  };
+
+  const remapEngine = (engine: LlamaEngine): LlamaEngine => {
+    if (!remap) return engine;
+    return {
+      ...engine,
+      path: applyPathRemap(engine.path, remap),
+    };
+  };
+
+  const remappedIncomingModels = (incoming.models || []).map(remapModel);
+  const remappedIncomingEngines = (incoming.engines || []).map(remapEngine);
+
+  const isMissing = (path?: string) => {
+    if (!path) return true;
+    return missingPaths.has(pathIdentity(path));
+  };
+
+  let addedModels = 0;
+  let updatedModels = 0;
+  let skippedModels = 0;
+  let addedEngines = 0;
+
+  if (mode === "overwrite") {
+    const models: ModelAsset[] = [];
+    for (const raw of remappedIncomingModels) {
+      if (missingPathStrategy === "skip" && isMissing(raw.path)) {
+        skippedModels += 1;
+        continue;
+      }
       models.push(raw);
-      byPath.set(key(path), raw);
-      added += 1;
+      addedModels += 1;
+    }
+
+    const engines: LlamaEngine[] = [];
+    for (const engine of remappedIncomingEngines) {
+      if (missingPathStrategy === "skip" && isMissing(engine.path)) {
+        continue;
+      }
+      engines.push(engine);
+      addedEngines += 1;
+    }
+
+    return {
+      config: {
+        ...current,
+        serverPath: incoming.serverPath || current.serverPath,
+        activeEngineId: incoming.activeEngineId || current.activeEngineId,
+        engines,
+        models,
+        customTags: Array.from(new Set([...(current.customTags || []), ...(incoming.customTags || [])])),
+        theme: incoming.theme ?? current.theme,
+        language: incoming.language ?? current.language,
+        gpuMonitorEnabled: incoming.gpuMonitorEnabled ?? current.gpuMonitorEnabled,
+        exploreSidebarCollapsed: incoming.exploreSidebarCollapsed ?? current.exploreSidebarCollapsed,
+        preferredModelId: incoming.preferredModelId ?? current.preferredModelId,
+        preferredProfileId: incoming.preferredProfileId ?? current.preferredProfileId,
+        network: incoming.network ?? current.network,
+        llamacppDir: incoming.llamacppDir ?? current.llamacppDir,
+        modelsDir: incoming.modelsDir ?? current.modelsDir,
+        autoUpdateEnabled: incoming.autoUpdateEnabled ?? current.autoUpdateEnabled,
+        minimizeToTrayOnClose: incoming.minimizeToTrayOnClose ?? current.minimizeToTrayOnClose,
+        llamaBackend: incoming.llamaBackend ?? current.llamaBackend,
+        llamaCudaVersion: incoming.llamaCudaVersion ?? current.llamaCudaVersion,
+        shortcuts: incoming.shortcuts
+          ? { ...DEFAULT_SHORTCUTS, ...incoming.shortcuts }
+          : current.shortcuts,
+      },
+      addedModels,
+      updatedModels: 0,
+      skippedModels,
+      addedEngines,
+      importedSettings: true,
+    };
+  }
+
+  // Merge Mode
+  const byPath = new Map(current.models.map((model) => [pathIdentity(model.path), model]));
+  const byId = new Map(current.models.map((model) => [model.id, model]));
+  const models = [...current.models];
+
+  for (const raw of remappedIncomingModels) {
+    const path = raw.path;
+    if (!path && !raw.id) {
+      skippedModels += 1;
       continue;
     }
-    const known = new Set(existing.profiles.map((profile) => profile.id));
-    const profiles = [...existing.profiles];
-    for (const profile of raw.profiles || []) {
-      if (!known.has(profile.id)) {
-        profiles.push(profile);
-        known.add(profile.id);
+    if (missingPathStrategy === "skip" && isMissing(path)) {
+      skippedModels += 1;
+      continue;
+    }
+
+    const existing = (path ? byPath.get(pathIdentity(path)) : undefined) || byId.get(raw.id);
+    if (!existing) {
+      models.push(raw);
+      addedModels += 1;
+      continue;
+    }
+
+    let modelChanged = false;
+    const existingIndex = models.findIndex((m) => m.id === existing.id);
+    if (existingIndex < 0) continue;
+
+    const existingProfileMap = new Map(existing.profiles.map((p) => [p.id, p]));
+    const mergedProfiles = [...existing.profiles];
+
+    for (const incomingProfile of raw.profiles || []) {
+      const target = existingProfileMap.get(incomingProfile.id);
+      if (!target) {
+        mergedProfiles.push(incomingProfile);
+        modelChanged = true;
+      } else if (updateExistingProfiles) {
+        const idx = mergedProfiles.findIndex((p) => p.id === incomingProfile.id);
+        if (idx >= 0) {
+          mergedProfiles[idx] = { ...target, ...incomingProfile };
+          modelChanged = true;
+        }
       }
     }
-    const index = models.indexOf(existing);
-    if (index >= 0 && profiles.length !== existing.profiles.length) {
-      models[index] = { ...existing, profiles, tags: existing.tags?.length ? existing.tags : raw.tags };
-      byPath.set(key(path), models[index]);
-      updated += 1;
+
+    const mergedTags = Array.from(new Set([...(existing.tags || []), ...(raw.tags || [])]));
+    if (mergedTags.length !== (existing.tags || []).length) {
+      modelChanged = true;
+    }
+
+    const displayName = existing.displayName || raw.displayName;
+    if (displayName !== existing.displayName) {
+      modelChanged = true;
+    }
+
+    const defaultProfileId = existing.defaultProfileId || raw.defaultProfileId;
+    if (defaultProfileId !== existing.defaultProfileId) {
+      modelChanged = true;
+    }
+
+    if (modelChanged) {
+      models[existingIndex] = {
+        ...existing,
+        displayName,
+        defaultProfileId,
+        profiles: mergedProfiles,
+        tags: mergedTags.length ? mergedTags : undefined,
+      };
+      updatedModels += 1;
     }
   }
+
   const engines = [...(current.engines || [])];
-  const engineIds = new Set(engines.map((engine) => engine.id));
-  for (const engine of incoming.engines || []) {
-    if (!missing(engine.path) && !engineIds.has(engine.id)) {
+  const engineIds = new Set(engines.map((e) => e.id));
+  const enginePaths = new Set(engines.map((e) => pathIdentity(e.path)));
+
+  for (const engine of remappedIncomingEngines) {
+    if (missingPathStrategy === "skip" && isMissing(engine.path)) {
+      continue;
+    }
+    if (!engineIds.has(engine.id) && !enginePaths.has(pathIdentity(engine.path))) {
       engines.push(engine);
-      engineIds.add(engine.id);
+      addedEngines += 1;
     }
   }
+
+  const mergedConfig: AppConfig = {
+    ...current,
+    models,
+    engines,
+    customTags: Array.from(new Set([...(current.customTags || []), ...(incoming.customTags || [])])),
+    serverPath: current.serverPath || incoming.serverPath,
+    activeEngineId: current.activeEngineId || incoming.activeEngineId,
+  };
+
+  if (importAppSettings) {
+    if (incoming.network && (!current.network || current.network.proxyMode === "system")) {
+      mergedConfig.network = incoming.network;
+    }
+    if (incoming.llamaBackend && !current.llamaBackend) {
+      mergedConfig.llamaBackend = incoming.llamaBackend;
+    }
+    if (incoming.llamaCudaVersion && !current.llamaCudaVersion) {
+      mergedConfig.llamaCudaVersion = incoming.llamaCudaVersion;
+    }
+    if (incoming.modelsDir && !current.modelsDir) {
+      mergedConfig.modelsDir = incoming.modelsDir;
+    }
+    if (incoming.llamacppDir && !current.llamacppDir) {
+      mergedConfig.llamacppDir = incoming.llamacppDir;
+    }
+    if (incoming.theme && !current.theme) {
+      mergedConfig.theme = incoming.theme;
+    }
+    if (incoming.language && !current.language) {
+      mergedConfig.language = incoming.language;
+    }
+    if (incoming.preferredModelId && !current.preferredModelId) {
+      mergedConfig.preferredModelId = incoming.preferredModelId;
+    }
+    if (incoming.preferredProfileId && !current.preferredProfileId) {
+      mergedConfig.preferredProfileId = incoming.preferredProfileId;
+    }
+    const booleanSettings = ["gpuMonitorEnabled", "exploreSidebarCollapsed", "autoUpdateEnabled", "minimizeToTrayOnClose"] as const;
+    for (const key of booleanSettings) {
+      if (incoming[key] !== undefined && current[key] === undefined) {
+        mergedConfig[key] = incoming[key];
+      }
+    }
+    if (incoming.shortcuts) {
+      mergedConfig.shortcuts = {
+        ...(current.shortcuts ?? DEFAULT_SHORTCUTS),
+        ...incoming.shortcuts,
+      };
+    }
+  }
+
   return {
-    config: {
-      ...current,
-      models,
-      engines,
-      customTags: Array.from(new Set([...(current.customTags || []), ...(incoming.customTags || [])])),
-      serverPath: current.serverPath || (!missing(incoming.serverPath) ? incoming.serverPath : ""),
-      activeEngineId: current.activeEngineId || (engines.some((engine) => engine.id === incoming.activeEngineId) ? incoming.activeEngineId : undefined),
-    },
-    added,
-    updated,
-    skipped,
+    config: mergedConfig,
+    addedModels,
+    updatedModels,
+    skippedModels,
+    addedEngines,
+    importedSettings: importAppSettings,
   };
 }
 
@@ -77,21 +308,21 @@ export function removeModelsAtPaths(models: ModelAsset[], removedPaths: Iterable
   return models.filter((model) => !removed.has(pathIdentity(model.path, platform)));
 }
 export const DEFAULT_PROFILES: Profile[] = [
-  { id: "balanced", name: "均衡模式", description: "日常对话与编码的推荐配置", host: "0.0.0.0", port: 9931, gpuLayers: 35, contextSize: 8192, threads: 8, parallel: 1, batchSize: 512, ubatchSize: 256, flashAttention: true, ncmoeLayers: 0, mtp: false, mtpDraftPath: undefined, specDraftNMax: 3, cacheTypeK: "f32", cacheTypeV: "f32", jinja: true, reasoning: "auto", reasoningEffort: "auto", reasoningBudget: -1, noMmprojOffload: false, loadMode: "mmap", temperature: 0.7, topP: 0.9, minP: 0.05, repeatPenalty: 1.1, extraArgs: "" },
-  { id: "deep-thought", name: "深度思考", description: "长上下文与稳定输出，适合复杂推理", host: "0.0.0.0", port: 9931, gpuLayers: 48, contextSize: 32768, threads: 10, parallel: 1, batchSize: 512, ubatchSize: 256, flashAttention: true, ncmoeLayers: 0, mtp: false, mtpDraftPath: undefined, specDraftNMax: 3, cacheTypeK: "q8_0", cacheTypeV: "q8_0", jinja: true, reasoning: "on", reasoningEffort: "high", reasoningBudget: -1, noMmprojOffload: false, loadMode: "mmap", temperature: 0.55, topP: 0.92, minP: 0.03, repeatPenalty: 1.08, extraArgs: "" },
-  { id: "low-memory", name: "低显存", description: "保守卸载与小批次，降低资源占用", host: "0.0.0.0", port: 9931, gpuLayers: 12, contextSize: 4096, threads: 6, parallel: 1, batchSize: 128, ubatchSize: 128, flashAttention: true, ncmoeLayers: 0, mtp: false, mtpDraftPath: undefined, specDraftNMax: 3, cacheTypeK: "f16", cacheTypeV: "f16", jinja: false, reasoning: "auto", reasoningEffort: "auto", reasoningBudget: -1, noMmprojOffload: false, loadMode: "mmap", temperature: 0.75, topP: 0.9, minP: 0.05, repeatPenalty: 1.12, extraArgs: "" },
+  { id: "balanced", name: "均衡模式", description: "日常对话与编码的推荐配置", host: "0.0.0.0", port: 9931, gpuLayers: 35, contextSize: 8192, threads: 8, parallel: 1, batchSize: 512, ubatchSize: 256, flashAttention: true, ncmoeLayers: 0, mtp: false, mtpDraftPath: undefined, specDraftNMax: 3, cacheTypeK: "f32", cacheTypeV: "f32", jinja: true, reasoning: "auto", reasoningEffort: "auto", reasoningBudget: -1, noMmprojOffload: false, loadMode: "mmap", temperature: 0.7, topP: 0.9, minP: 0.05, repeatPenalty: 1.1, extraArgs: "", kvmemBudget: 36864, kvmemGenReserve: 16384 },
+  { id: "deep-thought", name: "深度思考", description: "长上下文与稳定输出，适合复杂推理", host: "0.0.0.0", port: 9931, gpuLayers: 48, contextSize: 32768, threads: 10, parallel: 1, batchSize: 512, ubatchSize: 256, flashAttention: true, ncmoeLayers: 0, mtp: false, mtpDraftPath: undefined, specDraftNMax: 3, cacheTypeK: "q8_0", cacheTypeV: "q8_0", jinja: true, reasoning: "on", reasoningEffort: "high", reasoningBudget: -1, noMmprojOffload: false, loadMode: "mmap", temperature: 0.55, topP: 0.92, minP: 0.03, repeatPenalty: 1.08, extraArgs: "", kvmemBudget: 36864, kvmemGenReserve: 16384 },
+  { id: "low-memory", name: "低显存", description: "保守卸载与小批次，降低资源占用", host: "0.0.0.0", port: 9931, gpuLayers: 12, contextSize: 4096, threads: 6, parallel: 1, batchSize: 128, ubatchSize: 128, flashAttention: true, ncmoeLayers: 0, mtp: false, mtpDraftPath: undefined, specDraftNMax: 3, cacheTypeK: "f16", cacheTypeV: "f16", jinja: false, reasoning: "auto", reasoningEffort: "auto", reasoningBudget: -1, noMmprojOffload: false, loadMode: "mmap", temperature: 0.75, topP: 0.9, minP: 0.05, repeatPenalty: 1.12, extraArgs: "", kvmemBudget: 36864, kvmemGenReserve: 16384 },
 ];
 
-/** ninfer 模型导入时的默认预设：对齐 NInfer 官方 s-128k 推荐配置，仅此一个 */
+/** ninfer 模型导入时的默认预设：对齐 NInfer 官方 64K 纯文本推荐配置，仅此一个 */
 export const DEFAULT_NINFER_PROFILES: Profile[] = [
   {
-    id: "s-128k",
-    name: "NInfer · 128K",
-    description: "对齐 NInfer 官方推荐：xhigh 深度思考 · 输出不设限 · rk8v4 KV",
+    id: "s-64k",
+    name: "NInfer · 64K",
+    description: "对齐 NInfer 官方推荐：64K 纯文本 · xhigh 深度思考 · 输出不设限 · k8v4 KV",
     host: "127.0.0.1",
     port: 18081,
     gpuLayers: 99,
-    contextSize: 131072,
+    contextSize: 65536,
     threads: 8,
     parallel: 1,
     batchSize: 512,
@@ -100,8 +331,8 @@ export const DEFAULT_NINFER_PROFILES: Profile[] = [
     ncmoeLayers: 0,
     mtp: true,
     specDraftNMax: 4,
-    cacheTypeK: "rk8v4",
-    cacheTypeV: "rk8v4",
+    cacheTypeK: "k8v4",
+    cacheTypeV: "k8v4",
     jinja: true,
     reasoning: "on",
     reasoningEffort: "xhigh",
@@ -113,22 +344,32 @@ export const DEFAULT_NINFER_PROFILES: Profile[] = [
     minP: 0.0,
     repeatPenalty: 1.0,
     extraArgs: "",
-    kvDtype: "rk8v4",
+    kvDtype: "k8v4",
     prefillChunk: 256,
-    fastPrefillKernel: true,
-    cudaMemoryPolicy: "strict",
+    fastPrefillKernel: false,
+    cudaMemoryPolicy: "default",
     deviceIndex: 0,
-    deviceProfile: "off",
+    deviceProfile: "auto",
     specMtp: true,
     draftTokens: 4,
     adaptiveMtp: true,
     ngramDraftTokens: 31,
     hostCacheMib: 6144,
-    kvCapacity: 131072,
+    kvCapacity: 65536,
     defaultMaxTokens: 0,
     topK: 20,
     seed: 42,
     cudaGraphAllowanceMib: 72,
+    gdnStateFp16: true,
+    useAltPrefixCaching: true,
+    deviceSnapshotSlots: 1,
+    preserveThinking: true,
+    vision: false,
+    visionCpu: false,
+    kvmemBudget: 36864,
+    kvmemGenReserve: 16384,
+    kvmemHostMib: 16384,
+    kvmemSessions: 1,
   },
 ];
 
@@ -187,6 +428,8 @@ export function migrateConfig(config: AppConfig): AppConfig {
         const rawBudget = (p as Partial<Profile>).reasoningBudget;
         const hasReasoningBudget = typeof rawBudget === "number" && Number.isFinite(rawBudget);
         const hasNoMmprojOffload = typeof (p as Partial<Profile>).noMmprojOffload === "boolean";
+        const hasKvmemBudget = typeof (p as Partial<Profile>).kvmemBudget === "number";
+        const hasKvmemGenReserve = typeof (p as Partial<Profile>).kvmemGenReserve === "number";
         return {
           ...p,
           ncmoeLayers: hasNcmoe ? (p as Profile).ncmoeLayers : (legacy.ncmoe ? 1 : 0),
@@ -195,6 +438,8 @@ export function migrateConfig(config: AppConfig): AppConfig {
           specDraftNMax: hasSpecDraftNMax ? (p as Profile).specDraftNMax : 3,
           reasoningBudget: hasReasoningBudget ? Math.max(-1, Math.trunc(rawBudget!)) : -1,
           noMmprojOffload: hasNoMmprojOffload ? (p as Profile).noMmprojOffload : false,
+          kvmemBudget: hasKvmemBudget ? (p as Profile).kvmemBudget : 36864,
+          kvmemGenReserve: hasKvmemGenReserve ? (p as Profile).kvmemGenReserve : 16384,
         };
       }),
     };
@@ -228,7 +473,21 @@ export function migrateConfig(config: AppConfig): AppConfig {
     }
   }
 
-  return { ...config, models, engines, activeEngineId };
+  let shortcuts = config.shortcuts
+    ? {
+        ...DEFAULT_SHORTCUTS,
+        ...config.shortcuts,
+      }
+    : {
+        ...DEFAULT_SHORTCUTS,
+        enabled: false,
+      };
+
+  if (shortcuts.switchEngine === "Ctrl+E") {
+    shortcuts.switchEngine = "Alt+Shift+E";
+  }
+
+  return { ...config, models, engines, activeEngineId, shortcuts };
 }
 export const INITIAL_LOGS: LlamaLogPayload[] = [
   { stream: "system", line: "CookLLM runtime initialized · waiting for a model", timestamp: Date.now() - 1800 },

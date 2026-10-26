@@ -1,0 +1,581 @@
+/* 可伸缩侧边菜单：宽度由 --sidebar-w 驱动，收起态为 64px 图标轨；收放平滑过渡 */
+.app-shell {
+  display: grid;
+  grid-template-columns: var(--sidebar-w, 250px) 1fr;
+  height: 100vh;
+  background: var(--bg);
+  transition: grid-template-columns .18s ease;
+}
+
+.app-shell.sidebar-collapsed {
+  --sidebar-w: 64px;
+}
+
+.app-shell.zen-mode {
+  --sidebar-w: 0px;
+  grid-template-columns: 0px 1fr;
+}
+
+.app-shell.zen-mode .sidebar {
+  width: 0 !important;
+  min-width: 0 !important;
+  max-width: 0 !important;
+  padding: 0 !important;
+  border-right: none !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  overflow: hidden !important;
+}
+
+.app-shell.zen-mode .chat-header {
+  display: none !important;
+}
+
+.app-shell.zen-mode .log-dock {
+  display: none !important;
+}
+
+.app-shell.zen-mode .topbar .launcher-capsule {
+  display: none !important;
+}
+
+.sidebar {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  padding: 24px 14px 14px;
+  border-right: 1px solid #2c2c2c;
+  background: linear-gradient(180deg, #1e1e1e 0%, #181818 100%);
+  z-index: 3;
+  transition: padding .18s ease;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px 28px;
+}
+
+.brand-mark {
+  display: grid;
+  place-items: center;
+  transform: translateY(-7px);
+}
+
+.brand strong {
+  display: block;
+  font-size: 20px;
+  letter-spacing: -.02em;
+}
+
+.brand span {
+  display: block;
+  margin-top: 3px;
+  color: #6f7888;
+  font: 600 12px/1 JetBrains Mono, monospace;
+  letter-spacing: .16em;
+}
+
+.side-section-label {
+  padding: 0 11px 8px;
+  color: #596273;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: .12em;
+}
+
+.side-nav {
+  display: grid;
+  gap: 4px;
+}
+
+.side-link {
+  position: relative;
+  display: grid;
+  grid-template-columns: 22px 1fr auto;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 10px 11px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: #8d97a9;
+  font-size: 15px;
+  text-align: left;
+  transition: .18s ease;
+}
+
+.side-link:hover {
+  color: #d9deea;
+  background: #242424;
+}
+
+.side-link.active {
+  color: #fff6ec;
+  border-color: #48351f;
+  background: linear-gradient(90deg, rgba(255, 107, 40, .18), rgba(255, 107, 40, .07));
+}
+
+.side-link.active:before {
+  content: "";
+  position: absolute;
+  left: -15px;
+  width: 3px;
+  height: 22px;
+  border-radius: 0 3px 3px 0;
+  background: #f2a260;
+  box-shadow: 0 0 13px #ee9b55;
+}
+
+.side-link em {
+  min-width: 21px;
+  padding: 2px 5px;
+  border-radius: 10px;
+  color: #bd9469;
+  background: #261f17;
+  font-style: normal;
+  font-size: 14px;
+  text-align: center;
+}
+
+.side-link .download-badge {
+  color: #fff;
+  background: #b8471a;
+  box-shadow: 0 0 8px rgba(184, 71, 26, .45);
+  animation: badge-pulse 1.6s ease-in-out infinite;
+}
+
+.side-link .download-badge {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-radius: 50%;
+  color: #e8b06a;
+  font: 700 10px JetBrains Mono, monospace;
+}
+
+.side-link .download-badge svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  transform: rotate(-90deg);
+}
+
+.side-link .download-badge .badge-track {
+  fill: none;
+  stroke: #33291c;
+  stroke-width: 2.5;
+}
+
+.side-link .download-badge .badge-fill {
+  fill: none;
+  stroke: #f2a260;
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  stroke-dasharray: 43.98;
+  transition: stroke-dashoffset .4s ease;
+}
+
+[data-theme="light"] .side-link .download-badge {
+  color: #a4622a;
+}
+
+[data-theme="light"] .side-link .download-badge .badge-track {
+  stroke: #f0e4d4;
+}
+
+[data-theme="light"] .side-link .download-badge .badge-fill {
+  stroke: #d97a28;
+}
+
+.side-link .update-dot {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ff4d5e;
+  box-shadow: 0 0 8px rgba(255, 77, 94, .7);
+  animation: badge-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes badge-pulse {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: .7;
+  }
+}
+
+.side-divider {
+  height: 1px;
+  margin: 17px 8px;
+  background: #282828;
+}
+
+.sidebar-spacer {
+  flex: 1;
+}
+
+/* 收起态（图标轨）：仅保留导航图标，文字 / 徽标 / 章节标签隐藏；GPU 监测卡保持挂载仅视觉隐藏（迷你图历史不丢），品牌行只留幽灵收放按钮居中作展开入口 */
+.sidebar.collapsed {
+  padding: 24px 10px 14px;
+}
+
+.sidebar.collapsed .brand {
+  justify-content: center;
+  gap: 0;
+}
+
+.sidebar.collapsed .brand-mark,
+.sidebar.collapsed .brand-name {
+  display: none;
+}
+
+.sidebar.collapsed .sidebar-toggle {
+  margin-left: 0;
+}
+
+.sidebar.collapsed .side-section-label {
+  display: none;
+}
+
+.sidebar.collapsed .side-link {
+  grid-template-columns: 1fr;
+  justify-items: center;
+  padding: 10px 0;
+}
+
+.sidebar.collapsed .side-link span,
+.sidebar.collapsed .side-link em {
+  display: none;
+}
+
+.sidebar.collapsed .side-link.active:before {
+  display: none;
+}
+
+.sidebar.collapsed .mini-status {
+  display: none;
+}
+
+/* 收起 / 展开按钮：品牌行右对齐的无边框幽灵图标按钮，默认仅淡灰图标融入背景，悬停圆角淡底作轻量反馈 */
+.sidebar-toggle {
+  flex: none;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 7px;
+  color: #7f8a9d;
+  background: transparent;
+  transition: .18s ease;
+}
+
+.sidebar-toggle:hover {
+  color: #ffd9ad;
+  background: rgba(255, 255, 255, .07);
+}
+
+.runtime-card {
+  margin: 0 2px 12px;
+  padding: 13px;
+  border: 1px solid #333333;
+  border-radius: 12px;
+  background: linear-gradient(145deg, #252525, #1c1c1c);
+}
+
+.runtime-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #8e98a9;
+  font-size: 15px;
+}
+
+.runtime-head i {
+  margin-left: auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #36d38b;
+  box-shadow: 0 0 9px #36d38b;
+}
+
+.runtime-icon {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  color: #eba45c;
+  border-radius: 7px;
+  background: #302113;
+}
+
+.runtime-card>strong {
+  display: block;
+  margin-top: 12px;
+  font: 600 16px JetBrains Mono, monospace;
+}
+
+.runtime-card p {
+  margin: 5px 0 10px;
+  color: #697385;
+  font-size: 14px;
+}
+
+.runtime-meta {
+  display: flex;
+  gap: 5px;
+}
+
+.runtime-meta span {
+  padding: 3px 5px;
+  color: #6f788a;
+  border: 1px solid #333333;
+  border-radius: 4px;
+  font: 600 11px JetBrains Mono, monospace;
+  letter-spacing: .08em;
+}
+
+/* 左下角 GPU 性能监测 + 功耗：纯色扁平卡片，仅保留轻边框，无渐变 / 光晕 / 投影 */
+.mini-status {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin: 0 2px;
+  padding: 10px 10px 8px;
+  border: 1px solid #2f2f2f;
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.ms-caption {
+  color: #8b96a9;
+  font: 600 10px/1 JetBrains Mono, monospace;
+  letter-spacing: .11em;
+  white-space: nowrap;
+  padding-left: 1px;
+}
+
+/* 指标行：数值左、80×36 网格迷你图右 */
+.ms-metric {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 80px;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.ms-metric + .ms-metric {
+  padding-top: 7px;
+  border-top: 1px solid rgba(255, 255, 255, .07);
+}
+
+.ms-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.ms-view-title {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  white-space: nowrap;
+  color: #8b96a9;
+  font: 600 9.5px/1 JetBrains Mono, monospace;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+
+.ms-val {
+  display: flex;
+  align-items: baseline;
+  gap: 2px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  color: #e8edf5;
+  font-variant-numeric: tabular-nums;
+}
+
+.ms-val b {
+  font: 600 17px/1 JetBrains Mono, monospace;
+  letter-spacing: -.02em;
+}
+
+.ms-unit {
+  color: #8b96a9;
+  font: 500 9px/1 JetBrains Mono, monospace;
+  letter-spacing: .03em;
+}
+
+/* 网格迷你图：尺寸由宿主容器控制；网格背景始终渲染 */
+.ms-spark {
+  width: 80px;
+  height: 36px;
+  display: block;
+  overflow: visible;
+}
+
+/* 曲线下方纯色填充：低透明度，不加渐变 */
+.ms-area {
+  fill: rgba(251, 191, 36, .14);
+}
+
+.ms-grid line {
+  stroke: rgba(255, 255, 255, .055);
+}
+
+.ms-grid line.edge {
+  stroke: rgba(255, 255, 255, .12);
+}
+
+.ms-spark polyline {
+  fill: none;
+  stroke: #fbbf24;
+  stroke-width: 1.3;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+/* 底栏：功耗 + 健康灯 / 版本号 / 主题切换 */
+.ms-power {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding-top: 7px;
+  border-top: 1px solid rgba(255, 255, 255, .07);
+  color: #8b96a9;
+  font: 500 9.5px/1 JetBrains Mono, monospace;
+  white-space: nowrap;
+}
+
+.ms-power > svg {
+  flex: none;
+  color: #f97316;
+  opacity: .9;
+}
+
+/* GPU 监测关闭时仅保留此行：不再额外分隔 / 内边距 */
+.ms-power-only {
+  font-size: 12px;
+  gap: 8px;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.ms-state-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #a7b0c0;
+  font-weight: 600;
+}
+
+.ms-power b {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #e8edf5;
+  font: 600 10.5px/1 JetBrains Mono, monospace;
+}
+
+/* 健康灯（底栏右端）：灰 = 未启动，绿 = 运行中，玫红闪烁 = 服务异常 */
+.ms-health {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #4a5468;
+}
+
+.mini-status.running .ms-health {
+  background: #36d38b;
+  box-shadow: 0 0 6px rgba(54, 211, 139, .6);
+}
+
+.mini-status.abnormal .ms-health {
+  background: #e26f91;
+  box-shadow: 0 0 8px rgba(226, 111, 145, .7);
+  animation: dock-pulse 1.4s ease infinite;
+}
+
+/* 健康灯 + 版本号沉底至功耗行右端，auto margin 推右 */
+.ms-app-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  margin-left: auto;
+}
+
+.ms-theme-toggle {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: #8b96a9;
+  background: transparent;
+  cursor: pointer;
+  transition: .15s ease;
+}
+
+.ms-theme-toggle:hover {
+  color: #ffd9ad;
+  border-color: rgba(249, 115, 22, .45);
+  background: rgba(249, 115, 22, .08);
+}
+
+.ms-version {
+  color: #8b96a9;
+  font: 500 9.5px/1 JetBrains Mono, monospace;
+  white-space: nowrap;
+}
+
+.theme-icon-button {
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+}
+
+.theme-icon-button:hover {
+  color: #ffd9ad;
+  background: #2c2c2c;
+}
+
+.theme-icon-button.active {
+  color: #ffd9ad;
+  background: #2c2c2c;
+}
+
+[data-theme="light"] .theme-icon-button:hover,
+[data-theme="light"] .theme-icon-button.active {
+  color: #bd5c16;
+  background: #eef1f6;
+}
+

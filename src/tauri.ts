@@ -5,7 +5,7 @@ import { APP_REPO, APP_VERSION, PROJECT_URL } from "./data";
 import { canAutoInstallApp, canAutoInstallEngine, autoEngineBackend, getPlatform, isHttpUrl } from "./platform";
 import { formatMessage, getLocale } from "./i18n";
 import { isNewerVersion } from "./utils";
-import type { AppConfig, DiskUsage, GpuStats, HfDownloadResult, HfFile, HfModel, LlamaLogPayload, ModelDownloadProgress, ServerStatus } from "./types";
+import type { AppConfig, DiskUsage, EngineType, GpuStats, HfDownloadResult, HfFile, HfModel, LlamaBackend, LlamaLogPayload, ModelDownloadProgress, ProxyMode, ServerStatus } from "./types";
 
 export const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -32,6 +32,12 @@ export async function stopServer(): Promise<ServerStatus> {
 
 export async function getServerStatus(): Promise<ServerStatus> {
   return invoke<ServerStatus>("get_server_status");
+}
+
+/** NInfer --request-log-jsonl 增量记录（server_start / request_start / request_done）；llama.cpp 或未运行返回空 */
+export async function readNinferRequestLog(): Promise<unknown[]> {
+  if (!isTauri()) return [];
+  return invoke<unknown[]>("read_ninfer_request_log");
 }
 
 export interface OrphanProcessItem {
@@ -112,6 +118,39 @@ export async function onLlamaLog(handler: (payload: LlamaLogPayload) => void): P
   return listen<LlamaLogPayload>("llama-log", (event) => handler(event.payload));
 }
 
+export async function onTrayViewError(handler: (errorMessage: string) => void): Promise<UnlistenFn | undefined> {
+  if (!isTauri()) return undefined;
+  return listen<string>("tray_view_error", (event) => handler(event.payload));
+}
+
+/** 服务生命周期事件载荷：托盘 / 主界面任一侧发生启动、就绪、停止、失败时由后端广播 */
+export interface ServerLifecyclePayload {
+  /** starting = 进程已拉起（接口尚未就绪）；ready = HTTP 接口可服务；stopped = 主动停止；failed = 启动失败 / 进程意外退出 */
+  phase: "starting" | "ready" | "stopped" | "failed";
+  /** starting 时携带新服务的完整状态（running: true） */
+  status?: ServerStatus | null;
+  /** failed 时携带错误信息 */
+  error?: string | null;
+}
+
+/** 订阅服务生命周期事件：保证托盘操作与主界面状态、过渡动画严格同步 */
+export async function onServerLifecycle(handler: (payload: ServerLifecyclePayload) => void): Promise<UnlistenFn | undefined> {
+  if (!isTauri()) return undefined;
+  return listen<ServerLifecyclePayload>("server-lifecycle", (event) => handler(event.payload));
+}
+
+/** 订阅后台配置更新事件 */
+export async function onConfigUpdated(handler: (config: AppConfig) => void): Promise<UnlistenFn | undefined> {
+  if (!isTauri()) return undefined;
+  return listen<AppConfig>("config-updated", (event) => handler(event.payload));
+}
+
+/** 订阅全局快捷键呼出引擎管理界面事件 */
+export async function onShortcutOpenEngineHub(handler: () => void): Promise<UnlistenFn | undefined> {
+  if (!isTauri()) return undefined;
+  return listen<void>("shortcut-open-engine-hub", () => handler());
+}
+
 /** Write to the system clipboard (Tauri fallback when the iframe Clipboard API fails). */
 export async function writeClipboard(text: string): Promise<void> {
   if (!isTauri()) throw new Error("clipboard write is only available in Tauri");
@@ -147,6 +186,13 @@ export async function inspectGguf(path: string): Promise<GgufMeta> {
   return invoke<GgufMeta>("inspect_gguf", { path });
 }
 
+export interface ConfigBackupEnvelope {
+  kind: string;
+  version: number;
+  exportedAt?: number;
+  config: AppConfig;
+}
+
 /** 导出当前配置到用户选择的 JSON 文件；取消时返回空字符串。Token 不会写入备份。 */
 export async function exportConfigBackup(): Promise<string> {
   if (!isTauri()) throw new Error("配置备份仅在桌面端可用");
@@ -154,9 +200,16 @@ export async function exportConfigBackup(): Promise<string> {
 }
 
 /** 选择并解析一份配置备份；用户取消时返回 null。 */
-export async function pickConfigBackup(): Promise<AppConfig | null> {
+export async function pickConfigBackup(): Promise<ConfigBackupEnvelope | null> {
   if (!isTauri()) throw new Error("配置导入仅在桌面端可用");
-  return invoke<AppConfig | null>("pick_config_backup");
+  return invoke<ConfigBackupEnvelope | null>("pick_config_backup");
+}
+
+
+/** 打开系统目录选择对话框；取消时返回 null。 */
+export async function pickDirectory(): Promise<string | null> {
+  if (!isTauri()) return null;
+  return invoke<string | null>("pick_directory");
 }
 
 export async function openConfigDir(): Promise<void> {
@@ -254,7 +307,7 @@ export async function installAppUpdate(path: string, update?: UpdateCheckResult)
 
 export interface HardwareSuggestion {
   /** 推荐后端：cuda | vulkan | cpu */
-  recommendedBackend: "cuda" | "vulkan" | "cpu";
+  recommendedBackend: LlamaBackend;
   gpuName?: string | null;
   cudaSupported: boolean;
   vulkanSupported: boolean;
@@ -283,7 +336,7 @@ export async function getSystemProxy(): Promise<string | null> {
 }
 
 export async function testProxyConnection(
-  proxyMode: "system" | "manual" | "direct",
+  proxyMode: ProxyMode,
   proxyUrl: string,
 ): Promise<ProxyTestResult> {
   if (!isTauri()) return { ok: false, status: "N/A", detail: "仅 Tauri 桌面端可用", latencyMs: 0 };
@@ -293,7 +346,7 @@ export async function testProxyConnection(
 /* ==================== llama.cpp 引擎管理（阶段三） ==================== */
 
 export interface LlamaCppAsset {
-  backend: "cuda" | "vulkan" | "cpu";
+  backend: LlamaBackend;
   /** CUDA 主版本（如 "12" / "13"）；非 cuda 后端为空字符串 */
   cudaVersion?: string;
   /** CUDA 完整版本（如 "12.4" / "13.4"）；非 cuda 后端为空字符串 */
@@ -318,11 +371,11 @@ export interface LlamaCppRelease {
 export interface LlamaCppLocalStatus {
   installDir: string;
   localVersion?: string | null;
-  localBackend: "cuda" | "vulkan" | "cpu";
+  localBackend: LlamaBackend;
   cudaVersion?: string | null;
   serverAvailable: boolean;
   serverPath?: string | null;
-  engineType?: "llamacpp" | "ninfer" | "ninfer_kvmem" | string | null;
+  engineType?: EngineType | null;
 }
 
 export interface DownloadProgress {
@@ -453,10 +506,10 @@ export async function hfSearch(query: string, limit?: number, ggufOnly?: boolean
   return invoke<HfModel[]>("hf_search", payload);
 }
 
-/** 列出仓库 main 分支的 .gguf 与 .ninfer 模型文件 */
-export async function hfListFiles(repo: string): Promise<HfFile[]> {
+/** 列出仓库 main 分支的模型文件（支持按格式筛选） */
+export async function hfListFiles(repo: string, formatFilter?: FormatFilter): Promise<HfFile[]> {
   if (!isTauri()) return [];
-  return invoke<HfFile[]>("hf_list_files", { repo });
+  return invoke<HfFile[]>("hf_list_files", { repo, ...(formatFilter ? { formatFilter } : {}) });
 }
 
 /** 验证 Hugging Face Token（/whoami-v2），成功返回绑定的用户名 */
@@ -475,6 +528,55 @@ export async function hfAvatar(author: string): Promise<string | null> {
 export async function hfDownload(repo: string, file: string, taskId: string): Promise<HfDownloadResult> {
   if (!isTauri()) throw new Error("仅 Tauri 桌面端可用");
   return invoke<HfDownloadResult>("hf_download", { repo, file, taskId });
+}
+
+/* ==================== 社区探索（魔塔社区 ModelScope） ==================== */
+
+/** 本周魔塔社区热门模型（支持格式筛选） */
+export async function msTrending(limit?: number, ggufOnly?: boolean, skip?: number, sort?: string, quants?: number[], formatFilter?: FormatFilter): Promise<HfModel[]> {
+  if (!isTauri()) return [];
+  const payload = {
+    ...(limit ? { limit } : {}),
+    ...(ggufOnly !== undefined ? { ggufOnly } : {}),
+    ...(formatFilter ? { formatFilter } : {}),
+    ...(skip ? { skip } : {}),
+    ...(sort ? { sort } : {}),
+    ...(quants && quants.length ? { quants } : {})
+  };
+  return invoke<HfModel[]>("ms_trending", payload);
+}
+
+/** 搜索魔塔社区模型（支持格式筛选） */
+export async function msSearch(query: string, limit?: number, ggufOnly?: boolean, skip?: number, sort?: string, quants?: number[], formatFilter?: FormatFilter): Promise<HfModel[]> {
+  if (!isTauri()) return [];
+  const payload = {
+    query,
+    ...(limit ? { limit } : {}),
+    ...(ggufOnly !== undefined ? { ggufOnly } : {}),
+    ...(formatFilter ? { formatFilter } : {}),
+    ...(skip ? { skip } : {}),
+    ...(sort ? { sort } : {}),
+    ...(quants && quants.length ? { quants } : {})
+  };
+  return invoke<HfModel[]>("ms_search", payload);
+}
+
+/** 列出魔塔社区仓库中的模型文件（支持按格式筛选） */
+export async function msListFiles(repo: string, formatFilter?: FormatFilter): Promise<HfFile[]> {
+  if (!isTauri()) return [];
+  return invoke<HfFile[]>("ms_list_files", { repo, ...(formatFilter ? { formatFilter } : {}) });
+}
+
+/** 获取魔搭作者（组织 / 用户）头像，返回 data URI；拉不到时返回 null（前端回退 ModelScope 官方徽章） */
+export async function msAvatar(author: string): Promise<string | null> {
+  if (!isTauri()) return null;
+  return invoke<string | null>("ms_avatar", { author });
+}
+
+/** 从魔塔社区下载模型文件（流式 + 进度事件）；taskId 为前端生成的唯一任务标识 */
+export async function msDownload(repo: string, file: string, taskId: string): Promise<HfDownloadResult> {
+  if (!isTauri()) throw new Error("仅 Tauri 桌面端可用");
+  return invoke<HfDownloadResult>("ms_download", { repo, file, taskId });
 }
 
 /** 从任意直链下载模型文件（流式 + 进度事件）；taskId 为前端生成的唯一任务标识 */
@@ -519,4 +621,10 @@ export async function revealInFolder(path: string): Promise<void> {
 export async function onModelDownloadProgress(handler: (payload: ModelDownloadProgress) => void): Promise<UnlistenFn | undefined> {
   if (!isTauri()) return undefined;
   return listen<ModelDownloadProgress>("model-download-progress", (event) => handler(event.payload));
+}
+
+/** 快捷键录制/弹窗模式切换：录制中临时解绑全局快捷键，避免与系统热键冲突与拦截 */
+export async function setShortcutsRecordingMode(recording: boolean): Promise<void> {
+  if (!isTauri()) return;
+  await invoke("set_shortcuts_recording_mode", { recording });
 }

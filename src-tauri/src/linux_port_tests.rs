@@ -198,7 +198,7 @@ fn process_fixture_worker() {
     };
     let child = Command::new("/bin/sh").args(["-c", script, "fixture"])
         .arg(&ready).arg(&stopped).process_group(0).spawn().unwrap();
-    let mut managed = ManagedProcess { child, status: ServerStatus::default() };
+    let mut managed = ManagedProcess { child, status: ServerStatus::default(), request_log: None };
     let pgid = managed.child.id() as i32;
     wait_until(|| ready.exists() && fs::metadata(&ready).unwrap().len() > 0);
     if mode == "parent-exit" {
